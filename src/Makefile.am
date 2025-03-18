@@ -36,9 +36,6 @@ LIBSECP256K1=secp256k1/libsecp256k1.la
 LIBUNIVALUE=univalue/libunivalue.la
 LIBZCASH=libzcash.a
 
-INSPECT_TOOL_BIN=zcash-inspect$(EXEEXT)
-INSPECT_TOOL_BUILD=$(top_builddir)/target/$(RUST_TARGET)/release/zcash-inspect$(EXEEXT)
-
 WALLET_TOOL_BIN=zcashd-wallet-tool$(EXEEXT)
 WALLET_TOOL_BUILD=$(top_builddir)/target/$(RUST_TARGET)/release/zcashd-wallet-tool$(EXEEXT)
 
@@ -56,18 +53,36 @@ CXXBRIDGE_RS = \
   rust/src/blake2b.rs \
   rust/src/ed25519.rs \
   rust/src/equihash.rs \
+  rust/src/history.rs \
+  rust/src/init.rs \
+  rust/src/random.rs \
+  rust/src/sapling/spec.rs \
+  rust/src/sapling/zip32.rs \
+  rust/src/sprout.rs \
   rust/src/streams.rs \
   rust/src/bridge.rs
 CXXBRIDGE_H = \
   rust/gen/include/rust/blake2b.h \
   rust/gen/include/rust/ed25519.h \
   rust/gen/include/rust/equihash.h \
+  rust/gen/include/rust/history.h \
+  rust/gen/include/rust/init.h \
+  rust/gen/include/rust/random.h \
+  rust/gen/include/rust/sapling/spec.h \
+  rust/gen/include/rust/sapling/zip32.h \
+  rust/gen/include/rust/sprout.h \
   rust/gen/include/rust/streams.h \
   rust/gen/include/rust/bridge.h
 CXXBRIDGE_CPP = \
   rust/gen/src/blake2b.cpp \
   rust/gen/src/ed25519.cpp \
   rust/gen/src/equihash.cpp \
+  rust/gen/src/history.cpp \
+  rust/gen/src/init.cpp \
+  rust/gen/src/random.cpp \
+  rust/gen/src/sapling/spec.cpp \
+  rust/gen/src/sapling/zip32.cpp \
+  rust/gen/src/sprout.cpp \
   rust/gen/src/streams.cpp \
   rust/gen/src/bridge.cpp
 
@@ -78,7 +93,7 @@ CXXBRIDGE_OPTS = -i rust/cxx.h
 $(CXXBRIDGE_RS): ;
 $(CXXBRIDGE_H) $(CXXBRIDGE_CPP): $(CXXBRIDGE_RS)
 	@$(MKDIR_P) $(@D)
-	$(AM_V_GEN)$(CXXBRIDGE) $(CXXBRIDGE_OPTS) rust/src/$(basename $(@F)).rs -o $@
+	$(AM_V_GEN)$(CXXBRIDGE) $(CXXBRIDGE_OPTS) $(basename $(patsubst rust/gen/include/rust/%,rust/src/%,$(patsubst rust/gen/src/%,rust/src/%,$@))).rs -o $@
 
 # We pass through CC etc. flags so they are available to Rust dependencies that internally
 # compile C or C++ code with the `cc` crate.
@@ -109,10 +124,11 @@ cargo_verbose_ = $(cargo_verbose_@AM_DEFAULT_V@)
 cargo_verbose_1 = --verbose
 
 if ENABLE_ONLINE_RUST
-# Ensure that .cargo/config does not exist
+# Ensure that .cargo/config.toml (or the older .cargo/config) does not exist.
 CARGO_CONFIGURED = $(top_srcdir)/.cargo/.configured-for-online
 $(CARGO_CONFIGURED):
-	$(AM_V_at)rm -f $(top_srcdir)/.cargo/.configured-for-offline $(top_srcdir)/.cargo/config
+	$(AM_V_at)rm -f $(top_srcdir)/.cargo/.configured-for-offline $(top_srcdir)/.cargo/config.toml
+	$(AM_V_at)rm -f $(top_srcdir)/.cargo/config
 	$(AM_V_at)touch $@
 
 else
@@ -120,10 +136,11 @@ else
 RUST_BUILD_OPTS += --locked --offline
 
 CARGO_CONFIGURED = $(top_srcdir)/.cargo/.configured-for-offline
-$(CARGO_CONFIGURED): $(top_srcdir)/.cargo/config.offline
+$(CARGO_CONFIGURED): $(top_srcdir)/.cargo/config.toml.offline
 	$(AM_V_at)rm -f $(top_srcdir)/.cargo/.configured-for-online
-	$(AM_V_at)cp $< $(top_srcdir)/.cargo/config
-	$(AM_V_at)echo "directory = \"$(RUST_VENDORED_SOURCES)\"" >>$(top_srcdir)/.cargo/config
+	$(AM_V_at)rm -f $(top_srcdir)/.cargo/config
+	$(AM_V_at)cp $< $(top_srcdir)/.cargo/config.toml
+	$(AM_V_at)echo "directory = \"$(RUST_VENDORED_SOURCES)\"" >>$(top_srcdir)/.cargo/config.toml
 	$(AM_V_at)touch $@
 endif
 if ENABLE_SHANI
@@ -137,9 +154,6 @@ cargo-build: $(CARGO_CONFIGURED) $(LIBSECP256K1)
 cargo-build-lib: cargo-build
 
 cargo-build-bins: cargo-build
-
-$(INSPECT_TOOL_BIN): cargo-build-bins
-	$(AM_V_at)cp $(INSPECT_TOOL_BUILD) $@
 
 $(WALLET_TOOL_BIN): cargo-build-bins
 	$(AM_V_at)cp $(WALLET_TOOL_BUILD) $@
@@ -190,7 +204,7 @@ endif
 
 if BUILD_BITCOIN_UTILS
   bin_PROGRAMS += zcash-cli zcash-tx
-  bin_SCRIPTS += $(INSPECT_TOOL_BIN) $(WALLET_TOOL_BIN)
+  bin_SCRIPTS += $(WALLET_TOOL_BIN)
 endif
 
 LIBZCASH_H = \
@@ -308,6 +322,7 @@ BITCOIN_CORE_H = \
   util/string.h \
   util/test.h \
   util/time.h \
+  util/vector.h \
   validationinterface.h \
   wallet/asyncrpcoperation_common.h \
   wallet/asyncrpcoperation_mergetoaddress.h \
@@ -755,7 +770,7 @@ DISTCLEANFILES = obj/build.h
 EXTRA_DIST = $(CTAES_DIST) rust
 
 clean-local:
-	rm -f $(top_srcdir)/.cargo/config $(top_srcdir)/.cargo/.configured-for-*
+	rm -f $(top_srcdir)/.cargo/config.toml $(top_srcdir)/.cargo/config $(top_srcdir)/.cargo/.configured-for-*
 	-$(MAKE) -C secp256k1 clean
 	-$(MAKE) -C univalue clean
 	rm -f leveldb/*/*.gcno leveldb/helpers/memenv/*.gcno

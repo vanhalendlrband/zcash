@@ -7,6 +7,8 @@
 #include "zcash/IncrementalMerkleTree.hpp"
 #include "transaction_builder.h"
 
+#include <rust/init.h>
+
 int GenZero(int n)
 {
     return 0;
@@ -25,9 +27,10 @@ void LoadProofParameters() {
         "librustzcash not configured correctly");
     auto sprout_groth16_str = sprout_groth16.native();
 
-    librustzcash_init_zksnark_params(
-        reinterpret_cast<const codeunit*>(sprout_groth16_str.c_str()),
-        sprout_groth16_str.length(),
+    init::zksnark_params(
+        rust::String(
+            reinterpret_cast<const codeunit*>(sprout_groth16_str.data()),
+            sprout_groth16_str.size()),
         true
     );
 }
@@ -76,9 +79,15 @@ template<> void AppendRandomLeaf(OrchardMerkleFrontier &tree) {
     // fortunately the tests only require that the tree root change.
     // TODO: Remove the need to create proofs by having a testing-only way to
     // append a random leaf to OrchardMerkleFrontier.
+    RawHDSeed seed(32, 0);
+    auto to = libzcash::OrchardSpendingKey::ForAccount(seed, 133, 0)
+        .ToFullViewingKey()
+        .GetChangeAddress();
     uint256 orchardAnchor;
     uint256 dataToBeSigned;
-    auto builder = orchard::Builder(true, true, orchardAnchor);
+    // TODO: Create bundle.
+    auto builder = orchard::Builder(false, orchardAnchor);
+    builder.AddOutput(std::nullopt, to, 0, std::nullopt);
     auto bundle = builder.Build().value().ProveAndSign({}, dataToBeSigned).value();
     tree.AppendBundle(bundle);
 }

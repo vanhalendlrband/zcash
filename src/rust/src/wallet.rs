@@ -13,7 +13,6 @@ use zcash_encoding::{Optional, Vector};
 use zcash_primitives::{
     consensus::BlockHeight,
     merkle_tree::{read_position, write_position},
-    sapling::NOTE_COMMITMENT_TREE_DEPTH,
     transaction::{components::Amount, TxId},
 };
 
@@ -150,7 +149,8 @@ pub struct Wallet {
     nullifiers: BTreeMap<Nullifier, OutPoint>,
     /// The incremental Merkle tree used to track note commitments and witnesses for notes
     /// belonging to the wallet.
-    commitment_tree: BridgeTree<MerkleHashOrchard, u32, NOTE_COMMITMENT_TREE_DEPTH>,
+    // TODO: Replace this with an `orchard` crate constant (they happen to be the same).
+    commitment_tree: BridgeTree<MerkleHashOrchard, u32, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>,
     /// The block height at which the last checkpoint was created, if any.
     last_checkpoint: Option<BlockHeight>,
     /// The block height and transaction index of the note most recently added to
@@ -167,12 +167,14 @@ pub struct Wallet {
     potential_spends: BTreeMap<Nullifier, BTreeSet<InPoint>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum WalletError {
     OutOfOrder(LastObserved, BlockHeight, usize),
     NoteCommitmentTreeFull,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RewindError {
     /// The note commitment tree does not contain enough checkpoints to
@@ -182,6 +184,7 @@ pub enum RewindError {
     InsufficientCheckpoints(usize),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum BundleLoadError {
     /// The action at the specified index failed to decrypt with
@@ -196,6 +199,7 @@ pub enum BundleLoadError {
     InvalidActionIndex(usize),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SpendRetrievalError {
     DecryptedNoteNotFound(OutPoint),
@@ -374,7 +378,7 @@ impl Wallet {
     }
 
     /// Add note data for those notes that are decryptable with one of this wallet's
-    /// incoming viewing keys to the wallet, and return a a data structure that describes
+    /// incoming viewing keys to the wallet, and return a data structure that describes
     /// the actions that are involved with this wallet, either spending notes belonging
     /// to this wallet or creating new notes owned by this wallet.
     #[tracing::instrument(level = "trace", skip(self))]
@@ -537,7 +541,7 @@ impl Wallet {
         );
         self.potential_spends
             .entry(*nf)
-            .or_insert_with(BTreeSet::new)
+            .or_default()
             .insert(inpoint);
     }
 
@@ -1255,6 +1259,7 @@ pub extern "C" fn orchard_wallet_gc_note_commitment_tree(wallet: *mut Wallet) {
 
 const NOTE_STATE_V1: u8 = 1;
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 #[no_mangle]
 pub extern "C" fn orchard_wallet_write_note_commitment_tree(
     wallet: *const Wallet,
@@ -1303,6 +1308,7 @@ pub extern "C" fn orchard_wallet_write_note_commitment_tree(
     }
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 #[no_mangle]
 pub extern "C" fn orchard_wallet_load_note_commitment_tree(
     wallet: *mut Wallet,
@@ -1370,7 +1376,10 @@ pub extern "C" fn orchard_wallet_load_note_commitment_tree(
 #[no_mangle]
 pub extern "C" fn orchard_wallet_init_from_frontier(
     wallet: *mut Wallet,
-    frontier: *const bridgetree::Frontier<MerkleHashOrchard, NOTE_COMMITMENT_TREE_DEPTH>,
+    frontier: *const bridgetree::Frontier<
+        MerkleHashOrchard,
+        { sapling::NOTE_COMMITMENT_TREE_DEPTH },
+    >,
 ) -> bool {
     let wallet = unsafe { wallet.as_mut() }.expect("Wallet pointer may not be null.");
     let frontier = unsafe { frontier.as_ref() }.expect("Wallet pointer may not be null.");

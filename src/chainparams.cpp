@@ -139,6 +139,8 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight = 1687104;
         consensus.vUpgrades[Consensus::UPGRADE_NU5].hashActivationBlock =
             uint256S("0000000000d723156d9b65ffcf4984da7a19675ed7e2f06d9e5d5188af087bf8");
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nProtocolVersion = 170120;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight = 2726400;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nProtocolVersion = 0x7FFFFFFF;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -167,8 +169,13 @@ public:
         keyConstants.bech32HRPs[SAPLING_EXTENDED_SPEND_KEY]   = "secret-extended-key-main";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_FVK]         = "zxviews";
 
+        keyConstants.bech32mHRPs[TEX_ADDRESS]                 = "tex";
         {
-            std::vector<std::string> ecc_addresses = {
+            auto canopyActivation = consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight;
+            auto nu6Activation = consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight;
+
+            // ZIP 214 Revision 0
+            std::vector<std::string> bp_addresses = {
                 "t3LmX1cxWPPPqL4TZHx42HU3U5ghbFjRiif",
                 "t3Toxk1vJQ6UjWQ42tUJz2rV2feUWkpbTDs",
                 "t3ZBdBe4iokmsjdhMuwkxEdqMCFN16YxKe6",
@@ -227,22 +234,41 @@ public:
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_BP,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2726400,
-                ecc_addresses);
+                canopyActivation,
+                nu6Activation,
+                bp_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_ZF,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2726400,
+                canopyActivation,
+                nu6Activation,
                 zf_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_MG,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2726400,
+                canopyActivation,
+                nu6Activation,
                 mg_addresses);
+
+            // ZIP 214 Revision 1
+            // FPF uses a single address repeated 12 times, once for each funding period.
+            std::vector<std::string> fpf_addresses(12, "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow");
+
+            consensus.AddZIP207FundingStream(
+                keyConstants,
+                Consensus::FS_FPF_ZCG,
+                nu6Activation,
+                3146400,
+                fpf_addresses);
+            consensus.AddZIP207LockboxStream(
+                keyConstants,
+                Consensus::FS_DEFERRED,
+                nu6Activation,
+                3146400);
         }
 
         // The best chain should have at least this much work.
-        consensus.nMinimumChainWork = uint256S("0x0000000000000000000000000000000000000000000000000c7da51ec335d66c");
+        consensus.nMinimumChainWork = uint256S("0x00000000000000000000000000000000000000000000000011be8336c45e2dd4");
 
         /**
          * The message start string should be awesome! ⓩ❤
@@ -301,10 +327,13 @@ public:
             (1400000, uint256S("0x0000000001155ecec0ad3924d47ad476c0a5ed7527b8776f53cbda1a780b9f76"))
             (1600000, uint256S("0x0000000000aae69fb228f90e77f34c24b7920667eaca726c3a3939536f03dcfc"))
             (1860000, uint256S("0x000000000043a968c78af5fb8133e00e6fe340051c19dd969e53ab62bf3dc22a"))
-            (2000000, uint256S("0x00000000010accaf2f87934765dc2e0bf4823a2b1ae2c1395b334acfce52ad68")),
-            1677602242,     // * UNIX timestamp of last checkpoint block
-            12380742,       // * total number of transactions between genesis and last checkpoint
-            7131            // * estimated number of transactions per day after checkpoint
+            (2000000, uint256S("0x00000000010accaf2f87934765dc2e0bf4823a2b1ae2c1395b334acfce52ad68"))
+            (2200000, uint256S("0x0000000001a0139c4c4d0e8f68cc562227c6003f4b1b640a3d921aeb8c3d2e3d"))
+            (2400000, uint256S("0x0000000000294d1c8d87a1b6566d302aa983691bc3cab0583a245389bbb9d285"))
+            (2600000, uint256S("0x0000000000b5ad92fcec0069d590f674d05ec7d96b1ff727863ea390950c4e49")),
+            1722834204,     // * UNIX timestamp of last checkpoint block
+            14608885,       // * total number of transactions between genesis and last checkpoint
+            6473            // * estimated number of transactions per day after checkpoint
                             //   (total number of tx * 48 * 24) / checkpoint block height
         };
 
@@ -432,6 +461,8 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight = 1842420;
         consensus.vUpgrades[Consensus::UPGRADE_NU5].hashActivationBlock =
             uint256S("0006d75c60b3093d1b671ff7da11c99ea535df9927c02e6ed9eb898605eb7381");
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nProtocolVersion = 170110;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight = 2976000;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nProtocolVersion = 0x7FFFFFFF;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -460,9 +491,15 @@ public:
         keyConstants.bech32HRPs[SAPLING_EXTENDED_SPEND_KEY]   = "secret-extended-key-test";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_FVK]         = "zxviewtestsapling";
 
+        keyConstants.bech32mHRPs[TEX_ADDRESS]                 = "textest";
+
         // Testnet funding streams
         {
-            std::vector<std::string> ecc_addresses = {
+            auto canopyActivation = consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight;
+            auto nu6Activation = consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight;
+
+            // ZIP 214 Revision 0
+            std::vector<std::string> bp_addresses = {
                 "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz",
                 "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz",
                 "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz",
@@ -523,18 +560,37 @@ public:
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_BP,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2796000,
-                ecc_addresses);
+                canopyActivation,
+                2796000, // *not* the NU6 activation height
+                bp_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_ZF,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2796000,
+                canopyActivation,
+                2796000, // *not* the NU6 activation height
                 zf_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_MG,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2796000,
+                canopyActivation,
+                2796000, // *not* the NU6 activation height
                 mg_addresses);
+
+            // ZIP 214 Revision 1
+            // FPF uses a single address repeated 13 times, once for each funding period.
+            // There are 13 periods because the start height does not align with a period boundary.
+            std::vector<std::string> fpf_addresses(13, "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu");
+            consensus.AddZIP207FundingStream(
+                keyConstants,
+                Consensus::FS_FPF_ZCG,
+                nu6Activation,
+                3396000,
+                fpf_addresses);
+            consensus.AddZIP207LockboxStream(
+                keyConstants,
+                Consensus::FS_DEFERRED,
+                nu6Activation,
+                3396000);
         }
 
         // On testnet we activate this rule 6 blocks after Blossom activation. From block 299188 and
@@ -679,6 +735,9 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nProtocolVersion = 170050;
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nProtocolVersion = 170110;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nProtocolVersion = 0x7FFFFFFF;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -702,6 +761,8 @@ public:
         keyConstants.bech32HRPs[SAPLING_INCOMING_VIEWING_KEY] = "zivkregtestsapling";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_SPEND_KEY]   = "secret-extended-key-regtest";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_FVK]         = "zxviewregtestsapling";
+
+        keyConstants.bech32mHRPs[TEX_ADDRESS]                 = "texregtest";
 
         // The best chain should have at least this much work.
         consensus.nMinimumChainWork = uint256S("0x00");

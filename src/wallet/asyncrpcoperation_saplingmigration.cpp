@@ -13,10 +13,12 @@
 
 #include <optional>
 #include <variant>
+#include <zip317.h>
 
 const int MIGRATION_EXPIRY_DELTA = 450;
 
-AsyncRPCOperation_saplingmigration::AsyncRPCOperation_saplingmigration(int targetHeight) : targetHeight_(targetHeight) {}
+AsyncRPCOperation_saplingmigration::AsyncRPCOperation_saplingmigration(int targetHeight, uint256 saplingAnchor) :
+    targetHeight_(targetHeight), saplingAnchor_(saplingAnchor) {}
 
 AsyncRPCOperation_saplingmigration::~AsyncRPCOperation_saplingmigration() {}
 
@@ -112,7 +114,14 @@ bool AsyncRPCOperation_saplingmigration::main_impl() {
     CCoinsViewCache coinsView(pcoinsTip);
     do {
         CAmount amountToSend = chooseAmount(availableFunds);
-        auto builder = TransactionBuilder(Params(), targetHeight_, std::nullopt, pwalletMain, &coinsView, &cs_main);
+        auto builder = TransactionBuilder(
+            Params(),
+            targetHeight_,
+            std::nullopt,
+            saplingAnchor_,
+            pwalletMain,
+            &coinsView,
+            &cs_main);
         builder.SetExpiryHeight(targetHeight_ + MIGRATION_EXPIRY_DELTA);
         LogPrint("zrpcunsafe", "%s: Beginning creating transaction with Sapling output amount=%s\n", getId(), FormatMoney(amountToSend - LEGACY_DEFAULT_FEE));
         std::vector<SproutNoteEntry> fromNotes;
@@ -151,13 +160,19 @@ bool AsyncRPCOperation_saplingmigration::main_impl() {
             }
         }
         assert(changeAddr.has_value());
-        // The amount chosen *includes* the default fee for this transaction, i.e.
-        // the value of the Sapling output will be 0.00001 ZEC less.
-        builder.SetFee(LEGACY_DEFAULT_FEE);
+
+        // The amount chosen includes the fee for this transaction, as it will be after
+        // adding the Sapling output. The first JoinSplit will consume two real inputs and
+        // each subsequent JoinSplit will consume one real input, usually (it is possible
+        // for the builder to use fewer JoinSplits but this only results in overestimating
+        // the fee). The number of Sapling outputs will be padded to 2.
+        auto fee = CalculateConventionalFee(2 * fromNotes.size() + 2);
+        builder.SetFee(fee);
+
         builder.AddSaplingOutput(
                 ovkForShieldingFromTaddr(seed),
                 migrationDestAddress,
-                amountToSend - LEGACY_DEFAULT_FEE,
+                amountToSend - fee,
                 std::nullopt);
         builder.SendChangeToSprout(changeAddr.value());
         CTransaction tx = builder.Build().GetTxOrThrow();
@@ -168,7 +183,7 @@ bool AsyncRPCOperation_saplingmigration::main_impl() {
         pwalletMain->AddPendingSaplingMigrationTx(tx);
         LogPrint("zrpcunsafe", "%s: Added pending migration transaction with txid=%s\n", getId(), tx.GetHash().ToString());
         ++numTxCreated;
-        amountMigrated += amountToSend - LEGACY_DEFAULT_FEE;
+        amountMigrated += amountToSend - fee;
         migrationTxIds.push_back(tx.GetHash().ToString());
     } while (numTxCreated < 5 && availableFunds > CENT);
 

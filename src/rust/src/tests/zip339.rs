@@ -9,45 +9,16 @@ use crate::zip339_ffi::{
     zip339_entropy_to_phrase, zip339_free_phrase, zip339_phrase_to_seed, zip339_validate_phrase,
     Language,
 };
-use zcash_primitives::zip339;
 
 #[test]
 fn test_try_from_language() {
-    assert_eq!(Language(0).try_into(), Ok(zip339::Language::English));
-    assert!(zip339::Language::try_from(Language(1234)).is_err());
-}
-
-#[test]
-#[should_panic]
-fn test_null_entropy_to_phrase_panics() {
-    zip339_entropy_to_phrase(Language(0), ptr::null(), 0);
+    assert_eq!(Language(0).try_into(), Ok(bip0039::Language::English));
+    assert!(bip0039::Language::try_from(Language(1234)).is_err());
 }
 
 #[test]
 fn test_free_null_phrase_is_noop() {
     zip339_free_phrase(ptr::null_mut());
-}
-
-#[test]
-#[should_panic]
-fn test_validate_null_phrase_panics() {
-    zip339_validate_phrase(Language(0), ptr::null());
-}
-
-#[test]
-#[should_panic]
-fn test_null_phrase_to_seed_panics() {
-    zip339_phrase_to_seed(Language(0), ptr::null(), ptr::NonNull::dangling().as_ptr());
-}
-
-#[test]
-#[should_panic]
-fn test_phrase_to_seed_with_null_buffer_panics() {
-    zip339_phrase_to_seed(
-        Language(0),
-        ptr::NonNull::dangling().as_ptr(),
-        ptr::null_mut(),
-    );
 }
 
 #[test]

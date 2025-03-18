@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2021 The Zcash developers
+# Copyright (c) 2021-2024 The Zcash developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -13,7 +13,7 @@ from test_framework.mininode import (
     msg_getdata,
     msg_mempool,
     msg_reject,
-    uint256_from_str,
+    uint256_from_reversed_hex,
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -21,17 +21,16 @@ from test_framework.util import (
     HEARTWOOD_BRANCH_ID,
     CANOPY_BRANCH_ID,
     NU5_BRANCH_ID,
-    LEGACY_DEFAULT_FEE,
     assert_equal,
     assert_false,
     assert_true,
     fail,
-    hex_str_to_bytes,
     nuparams,
     p2p_port,
     start_nodes,
     wait_and_assert_operationid_status,
 )
+from test_framework.zip317 import ZIP_317_FEE
 from tx_expiry_helper import TestNode
 
 import os.path
@@ -172,6 +171,7 @@ class Zip239Test(BitcoinTestFramework):
         [x.wait_for_verack() for x in test_nodes]
 
         net_version = self.nodes[0].getnetworkinfo()["protocolversion"]
+        print("Net version: {}".format(net_version))
         if net_version < NU5_PROTO_VERSION:
             # Sending a getdata message containing a MSG_WTX CInv message type
             # results in a reject message.
@@ -201,17 +201,17 @@ class Zip239Test(BitcoinTestFramework):
         opid = self.nodes[0].z_sendmany(sproutzaddr, [{
             'address': node1_taddr,
             'amount': 1,
-        }], 1, LEGACY_DEFAULT_FEE, 'AllowRevealedRecipients')
-        v4_txid = uint256_from_str(hex_str_to_bytes(
+        }], 1, ZIP_317_FEE, 'AllowRevealedRecipients')
+        v4_txid = uint256_from_reversed_hex(
             wait_and_assert_operationid_status(self.nodes[0], opid)
-        )[::-1])
+        )
 
         # Add v5 transaction to the mempool.
         v5_txid = self.nodes[0].sendtoaddress(node1_taddr, 1, "", "", True)
         v5_tx = self.nodes[0].getrawtransaction(v5_txid, 1)
         assert_equal(v5_tx['version'], 5)
-        v5_txid = uint256_from_str(hex_str_to_bytes(v5_txid)[::-1])
-        v5_auth_digest = uint256_from_str(hex_str_to_bytes(v5_tx['authdigest'])[::-1])
+        v5_txid = uint256_from_reversed_hex(v5_txid)
+        v5_auth_digest = uint256_from_reversed_hex(v5_tx['authdigest'])
 
         # Wait for the mempools to sync.
         self.sync_all()

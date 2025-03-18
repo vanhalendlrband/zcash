@@ -452,7 +452,7 @@ std::string HelpMessage(HelpMessageMode mode)
                 "Use given addresses for block subsidy share paid to the funding stream with id <streamId> (regtest-only)");
     }
     std::string debugCategories = "addrman, alert, bench, coindb, db, http, libevent, lock, mempool, mempoolrej, net, partitioncheck, pow, proxy, prune, "
-                             "rand, receiveunsafe, reindex, rpc, selectcoins, tor, zmq, zrpc, zrpcunsafe (implies zrpc)"; // Don't translate these
+                             "rand, receiveunsafe, reindex, rpc, selectcoins, tor, valuepool, zmq, zrpc, zrpcunsafe (implies zrpc)"; // Don't translate these
     strUsage += HelpMessageOpt("-debug=<category>", strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
         _("If <category> is not supplied or if <category> = 1, output all debugging information.") + " " + _("<category> can be:") + " " + debugCategories + ". " +
         _("For multiple specific categories use -debug=<category> multiple times."));
@@ -862,9 +862,10 @@ static void ZC_LoadParams(
 
     gettimeofday(&tv_start, 0);
 
-    librustzcash_init_zksnark_params(
-        reinterpret_cast<const codeunit*>(sprout_groth16_str.c_str()),
-        sprout_groth16_str.length(),
+    init::zksnark_params(
+        rust::String(
+            reinterpret_cast<const codeunit*>(sprout_groth16_str.data()),
+            sprout_groth16_str.size()),
         true
     );
 
@@ -1063,7 +1064,7 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
     std::set_new_handler(new_handler_terminate);
 
     // Set up global Rayon threadpool.
-    zcashd_init_rayon_threadpool();
+    init::rayon_threadpool();
 
     // ********************************************************* Step 2: parameter interactions
     const CChainParams& chainparams = Params();
@@ -1357,7 +1358,8 @@ bool AppInit2(boost::thread_group& threadGroup, CScheduler& scheduler)
             boost::split(vStreamAddrs, vStreamParams[3], boost::is_any_of(","));
 
             auto fs = Consensus::FundingStream::ParseFundingStream(
-                    chainparams.GetConsensus(), chainparams, nStartHeight, nEndHeight, vStreamAddrs);
+                    chainparams.GetConsensus(), chainparams,
+                    nStartHeight, nEndHeight, vStreamAddrs, true);
 
             UpdateFundingStreamParameters((Consensus::FundingStreamIndex) nFundingStreamId, fs);
         }

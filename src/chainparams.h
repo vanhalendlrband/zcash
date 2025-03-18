@@ -54,7 +54,8 @@ public:
             consensus.vUpgrades[Consensus::UPGRADE_BLOSSOM].nActivationHeight,
             consensus.vUpgrades[Consensus::UPGRADE_HEARTWOOD].nActivationHeight,
             consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight,
-            consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight);
+            consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight,
+            consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight);
     }
     const CMessageHeader::MessageStartChars& MessageStart() const { return pchMessageStart; }
     const std::vector<unsigned char>& AlertKey() const { return vAlertPubKey; }
@@ -93,6 +94,9 @@ public:
     }
     const std::string& Bech32HRP(Bech32Type type) const {
         return keyConstants.Bech32HRP(type);
+    }
+    const std::string& Bech32mHRP(Bech32mType type) const {
+        return keyConstants.Bech32mHRP(type);
     }
     const std::vector<SeedSpec6>& FixedSeeds() const { return vFixedSeeds; }
     const CCheckpointData& Checkpoints() const { return checkpointData; }

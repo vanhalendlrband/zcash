@@ -215,6 +215,36 @@ UniValue getnewaddress(const UniValue& params, bool fHelp)
     return keyIO.EncodeDestination(keyID);
 }
 
+UniValue z_converttex(const UniValue& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 1)
+        throw runtime_error(
+            "z_converttex ( \"transparentaddress\" )\n"
+            "\nConverts a transparent Zcash address to a TEX address.\n"
+
+            "\nArguments:\n"
+            "1. \"transparentaddress\" (string, required) \n"
+
+            "\nResult:\n"
+            "\"texaddress\"    (string) The converted ZIP 320 (TEX) address\n"
+
+            "\nExamples:\n"
+            + HelpExampleCli("z_converttex", "\"t1M72Sfpbz1BPpXFHz9m3CdqATR44Jvaydd\"")
+        );
+
+    KeyIO keyIO(Params());
+    auto decoded = keyIO.DecodePaymentAddress(params[0].get_str());
+    if (!decoded.has_value()) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address");
+    }
+    if (!std::holds_alternative<CKeyID>(decoded.value())) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Address is not a transparent p2pkh address");
+    }
+    auto p2pkhKey = std::get<CKeyID>(decoded.value());
+
+    return keyIO.EncodeTexAddress(p2pkhKey);
+}
+
 UniValue getrawchangeaddress(const UniValue& params, bool fHelp)
 {
     if (!EnsureWalletIsAvailable(fHelp))
@@ -281,14 +311,18 @@ static void SendMoney(const CTxDestination &address, CAmount nValue, bool fSubtr
 
     // Create and send the transaction
     CReserveKey reservekey(pwalletMain);
-    CAmount nFeeRequired;
+    CAmount nFeeRequired = -1;
     std::string strError;
     vector<CRecipient> vecSend;
-    int nChangePosRet = -1;
     CRecipient recipient = {scriptPubKey, nValue, fSubtractFeeFromAmount};
     vecSend.push_back(recipient);
-    if (!pwalletMain->CreateTransaction(vecSend, wtxNew, reservekey, nFeeRequired, nChangePosRet, strError)) {
-        if (!fSubtractFeeFromAmount && nValue + nFeeRequired > curBalance) {
+    bool fCreated;
+    {
+        int nChangePosRet = -1; // never used
+        fCreated = pwalletMain->CreateTransaction(vecSend, wtxNew, reservekey, nFeeRequired, nChangePosRet, strError);
+    }
+    if (!fCreated) {
+        if (!fSubtractFeeFromAmount && nFeeRequired >= 0 && nValue + nFeeRequired > curBalance) {
             strError = strprintf("Error: Insufficient funds to pay the fee. This transaction needs to spend %s "
                                  "plus a fee of at least %s, but only %s is available",
                                  DisplayMoney(nValue),
@@ -1318,10 +1352,13 @@ UniValue sendmany(const UniValue& params, bool fHelp)
 
     // Send
     CReserveKey keyChange(pwalletMain);
-    CAmount nFeeRequired = 0;
-    int nChangePosRet = -1;
     string strFailReason;
-    bool fCreated = pwalletMain->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired, nChangePosRet, strFailReason);
+    bool fCreated;
+    {
+        CAmount nFeeRequired = -1; // never used
+        int nChangePosRet = -1;    // never used
+        fCreated = pwalletMain->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired, nChangePosRet, strFailReason);
+    }
     if (!fCreated)
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, strFailReason);
     CValidationState state;
@@ -2959,7 +2996,7 @@ UniValue fundrawtransaction(const UniValue& params, bool fHelp)
         includeWatching = true;
 
     CMutableTransaction tx(origTx);
-    CAmount nFee;
+    CAmount nFee = -1;
     string strFailReason;
     int nChangePos = -1;
     if(!pwalletMain->FundTransaction(tx, nFee, nChangePos, strFailReason, includeWatching))
@@ -5964,6 +6001,7 @@ static const CRPCCommand commands[] =
     { "wallet",             "dumpprivkey",              &dumpprivkey,              true  },
     { "hidden",             "dumpwallet",               &dumpwallet,               true  },
     { "wallet",             "encryptwallet",            &encryptwallet,            true  },
+    { "wallet",             "z_converttex",             &z_converttex,             true  },
     { "wallet",             "getbalance",               &getbalance,               false },
     { "wallet",             "getnewaddress",            &getnewaddress,            true  },
     { "wallet",             "getrawchangeaddress",      &getrawchangeaddress,      true  },

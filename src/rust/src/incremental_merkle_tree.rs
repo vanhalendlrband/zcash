@@ -5,12 +5,9 @@ use std::io::{self, Read, Write};
 use bridgetree::{BridgeTree, Checkpoint, MerkleBridge};
 use incrementalmerkletree::{Address, Hashable, Level, Position};
 use zcash_encoding::{Optional, Vector};
-use zcash_primitives::{
-    merkle_tree::{
-        read_address, read_leu64_usize, read_nonempty_frontier_v1, read_position, write_address,
-        write_nonempty_frontier_v1, write_position, write_usize_leu64, HashSer,
-    },
-    sapling::NOTE_COMMITMENT_TREE_DEPTH,
+use zcash_primitives::merkle_tree::{
+    read_address, read_leu64_usize, read_nonempty_frontier_v1, read_position, write_address,
+    write_nonempty_frontier_v1, write_position, write_usize_leu64, HashSer,
 };
 
 pub const SER_V1: u8 = 1;
@@ -31,6 +28,7 @@ pub fn read_auth_fragment_v1<H: HashSer, R: Read>(
     Ok((position, alts_observed, values))
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 pub fn read_bridge_v1<H: HashSer + Ord + Clone, R: Read>(
     mut reader: R,
 ) -> io::Result<MerkleBridge<H>> {
@@ -96,6 +94,7 @@ pub fn read_bridge_v1<H: HashSer + Ord + Clone, R: Read>(
     ))
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 pub fn read_bridge_v2<H: HashSer + Ord + Clone, R: Read>(
     mut reader: R,
 ) -> io::Result<MerkleBridge<H>> {
@@ -141,6 +140,7 @@ pub fn read_bridge<H: HashSer + Ord + Clone, R: Read>(
     }
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 pub fn write_bridge_v2<H: HashSer + Ord, W: Write>(
     mut writer: W,
     bridge: &MerkleBridge<H>,
@@ -184,6 +184,7 @@ pub fn write_bridge<H: HashSer + Ord, W: Write>(
 /// ordinary circumstances, the checkpoint ID will be the block height at which the checkpoint was
 /// created, but since we don't have any source for this information, we require the caller to
 /// provide it; any unique identifier will do so long as the identifiers are ordered correctly.
+#[allow(clippy::needless_borrows_for_generic_args)]
 pub fn read_checkpoint_v2<R: Read>(
     mut reader: R,
     checkpoint_id: u32,
@@ -251,10 +252,11 @@ pub fn write_checkpoint_v3<W: Write>(
 /// such data the returned identifiers will *not* correspond to block heights. As such, checkpoint
 /// ids should always be treated as opaque, totally ordered identifiers without additional
 /// semantics.
+#[allow(clippy::needless_borrows_for_generic_args)]
 #[allow(clippy::redundant_closure)]
-pub fn read_tree<H: Hashable + HashSer + Ord + Clone, R: Read>(
+pub fn read_tree<H: Hashable + HashSer + Ord + Clone, const DEPTH: u8, R: Read>(
     mut reader: R,
-) -> io::Result<BridgeTree<H, u32, NOTE_COMMITMENT_TREE_DEPTH>> {
+) -> io::Result<BridgeTree<H, u32, DEPTH>> {
     let tree_version = reader.read_u8()?;
     let prior_bridges = Vector::read(&mut reader, |r| read_bridge(r, tree_version))?;
     let current_bridge = Optional::read(&mut reader, |r| read_bridge(r, tree_version))?;
@@ -309,9 +311,10 @@ pub fn read_tree<H: Hashable + HashSer + Ord + Clone, R: Read>(
     })
 }
 
-pub fn write_tree<H: Hashable + HashSer + Ord, W: Write>(
+#[allow(clippy::needless_borrows_for_generic_args)]
+pub fn write_tree<H: Hashable + HashSer + Ord, const DEPTH: u8, W: Write>(
     mut writer: W,
-    tree: &BridgeTree<H, u32, NOTE_COMMITMENT_TREE_DEPTH>,
+    tree: &BridgeTree<H, u32, DEPTH>,
 ) -> io::Result<()> {
     writer.write_u8(SER_V3)?;
     Vector::write(&mut writer, tree.prior_bridges(), |w, b| write_bridge(w, b))?;

@@ -33,6 +33,7 @@
 #include "transaction_builder.h"
 #include "ui_interface.h"
 #include "util/system.h"
+#include "util/match.h"
 #include "util/moneystr.h"
 #include "validationinterface.h"
 #include "zip317.h"
@@ -74,6 +75,7 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
         nNewTime = std::min(nNewTime, medianTimePast + MAX_FUTURE_BLOCK_TIME_MTP);
     }
 
+    // The timestamp of a given block template should not go backwards.
     if (nOldTime < nNewTime)
         pblock->nTime = nNewTime;
 
@@ -88,34 +90,6 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
 bool IsShieldedMinerAddress(const MinerAddress& minerAddr) {
     return !std::holds_alternative<boost::shared_ptr<CReserveScript>>(minerAddr);
 }
-
-class AddFundingStreamValueToTx
-{
-private:
-    CMutableTransaction &mtx;
-    sapling::Builder& saplingBuilder;
-    const CAmount fundingStreamValue;
-    const libzcash::Zip212Enabled zip212Enabled;
-public:
-    AddFundingStreamValueToTx(
-            CMutableTransaction &mtx,
-            sapling::Builder& saplingBuilder,
-            const CAmount fundingStreamValue,
-            const libzcash::Zip212Enabled zip212Enabled): mtx(mtx), saplingBuilder(saplingBuilder), fundingStreamValue(fundingStreamValue), zip212Enabled(zip212Enabled) {}
-
-    void operator()(const libzcash::SaplingPaymentAddress& pa) const {
-        saplingBuilder.add_recipient(
-            {},
-            pa.GetRawBytes(),
-            fundingStreamValue,
-            libzcash::Memo::ToBytes(std::nullopt));
-    }
-
-    void operator()(const CScript& scriptPubKey) const {
-        mtx.vout.push_back(CTxOut(fundingStreamValue, scriptPubKey));
-    }
-};
-
 
 class AddOutputsToCoinbaseTxAndSign
 {
@@ -141,23 +115,38 @@ public:
     }
 
     CAmount SetFoundersRewardAndGetMinerValue(sapling::Builder& saplingBuilder) const {
-        auto block_subsidy = GetBlockSubsidy(nHeight, chainparams.GetConsensus());
+        const auto& consensus = chainparams.GetConsensus();
+        const auto block_subsidy = consensus.GetBlockSubsidy(nHeight);
         auto miner_reward = block_subsidy; // founders' reward or funding stream amounts will be subtracted below
 
         if (nHeight > 0) {
             if (chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY)) {
-                auto fundingStreamElements = Consensus::GetActiveFundingStreamElements(
-                    nHeight,
-                    block_subsidy,
-                    chainparams.GetConsensus());
+                LogPrint("pow", "%s: Constructing funding stream outputs for height %d", __func__, nHeight);
+                for (const auto& [fsinfo, fs] : consensus.GetActiveFundingStreams(nHeight)) {
+                    const auto amount = fsinfo.Value(block_subsidy);
+                    miner_reward -= amount;
 
-                for (Consensus::FundingStreamElement fselem : fundingStreamElements) {
-                    miner_reward -= fselem.second;
-                    std::visit(AddFundingStreamValueToTx(mtx, saplingBuilder, fselem.second, GetZip212Flag()), fselem.first);
+                    examine(fs.Recipient(consensus, nHeight), match {
+                        [&](const libzcash::SaplingPaymentAddress& pa) {
+                            LogPrint("pow", "%s: Adding Sapling funding stream output of value %d", __func__, amount);
+                            saplingBuilder.add_recipient(
+                                {},
+                                pa.GetRawBytes(),
+                                amount,
+                                libzcash::Memo::ToBytes(std::nullopt));
+                        },
+                        [&](const CScript& scriptPubKey) {
+                            LogPrint("pow", "%s: Adding transparent funding stream output of value %d", __func__, amount);
+                            mtx.vout.emplace_back(amount, scriptPubKey);
+                        },
+                        [&](const Consensus::Lockbox& lockbox) {
+                            LogPrint("pow", "%s: Noting lockbox output of value %d", __func__, amount);
+                        }
+                    });
                 }
             } else if (nHeight <= chainparams.GetConsensus().GetLastFoundersRewardBlockHeight(nHeight)) {
                 // Founders reward is 20% of the block subsidy
-                auto vFoundersReward = miner_reward / 5;
+                const auto vFoundersReward = miner_reward / 5;
                 // Take some reward away from us
                 miner_reward -= vFoundersReward;
                 // And give it to the founders
@@ -167,13 +156,14 @@ public:
                 // last Founders' Reward block height + 1.
             }
         }
+        LogPrint("pow", "%s: Miner reward at height %d is %d", __func__, nHeight, miner_reward);
 
         return miner_reward + nFees;
     }
 
     void ComputeBindingSig(rust::Box<sapling::Builder> saplingBuilder, std::optional<orchard::UnauthorizedBundle> orchardBundle) const {
         auto consensusBranchId = CurrentEpochBranchId(nHeight, chainparams.GetConsensus());
-        auto saplingBundle = sapling::build_bundle(std::move(saplingBuilder), nHeight);
+        auto saplingBundle = sapling::build_bundle(std::move(saplingBuilder));
 
         // Empty output script.
         uint256 dataToBeSigned;
@@ -213,13 +203,14 @@ public:
 
     // Create Orchard output
     void operator()(const libzcash::OrchardRawAddress &to) const {
-        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight);
+        std::array<uint8_t, 32> saplingAnchor;
+        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight, saplingAnchor, true);
 
         // `enableSpends` must be set to `false` for coinbase transactions. This
         // means the Orchard anchor is unconstrained, so we set it to the empty
         // tree root via a null (all zeroes) uint256.
         uint256 orchardAnchor;
-        auto builder = orchard::Builder(false, true, orchardAnchor);
+        auto builder = orchard::Builder(true, orchardAnchor);
 
         // Shielded coinbase outputs must be recoverable with an all-zeroes ovk.
         uint256 ovk;
@@ -249,7 +240,8 @@ public:
 
     // Create Sapling output
     void operator()(const libzcash::SaplingPaymentAddress &pa) const {
-        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight);
+        std::array<uint8_t, 32> saplingAnchor;
+        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight, saplingAnchor, true);
 
         auto miner_reward = SetFoundersRewardAndGetMinerValue(*saplingBuilder);
 
@@ -265,7 +257,8 @@ public:
     // Create transparent output
     void operator()(const boost::shared_ptr<CReserveScript> &coinbaseScript) const {
         // Add the FR output and fetch the miner's output value.
-        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight);
+        std::array<uint8_t, 32> saplingAnchor;
+        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight, saplingAnchor, true);
 
         // Miner output will be vout[0]; Founders' Reward & funding stream outputs
         // will follow.
@@ -373,7 +366,11 @@ CBlockTemplate* BlockAssembler::CreateNewBlock(
     if (chainparams.MineBlocksOnDemand())
         pblock->nVersion = GetArg("-blockversion", pblock->nVersion);
 
-    pblock->nTime = GetTime();
+    // Setting nTime to 0 and then calling UpdateTime ensures that it is set to the
+    // nearest timestamp to the current time in the consensus-valid range (see #6960).
+    pblock->nTime = 0;
+    UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+
     const int64_t nMedianTimePast = pindexPrev->GetMedianTimePast();
     CCoinsViewCache view(pcoinsTip);
 

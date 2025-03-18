@@ -70,6 +70,7 @@ pub(crate) mod ffi {
     extern "Rust" {
         type Network;
 
+        #[allow(clippy::too_many_arguments)]
         fn network(
             network: &str,
             overwinter: i32,
@@ -78,6 +79,7 @@ pub(crate) mod ffi {
             heartwood: i32,
             canopy: i32,
             nu5: i32,
+            nu6: i32,
         ) -> Result<Box<Network>>;
     }
 
@@ -185,11 +187,15 @@ pub(crate) mod ffi {
         type SaplingBuilder;
 
         #[cxx_name = "new_builder"]
-        fn new_sapling_builder(network: &Network, height: u32) -> Box<SaplingBuilder>;
+        fn new_sapling_builder(
+            network: &Network,
+            height: u32,
+            anchor: [u8; 32],
+            coinbase: bool,
+        ) -> Result<Box<SaplingBuilder>>;
         fn add_spend(
             self: &mut SaplingBuilder,
             extsk: &[u8],
-            diversifier: [u8; 11],
             recipient: [u8; 43],
             value: u64,
             rcm: [u8; 32],
@@ -205,7 +211,6 @@ pub(crate) mod ffi {
         #[cxx_name = "build_bundle"]
         fn build_sapling_bundle(
             builder: Box<SaplingBuilder>,
-            target_height: u32,
         ) -> Result<Box<SaplingUnauthorizedBundle>>;
 
         #[cxx_name = "UnauthorizedBundle"]

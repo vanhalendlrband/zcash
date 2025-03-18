@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# Copyright (c) 2016 The Zcash developers
+# Copyright (c) 2016-2024 The Zcash developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
 from io import BytesIO
-import codecs
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     CANOPY_BRANCH_ID,
-    LEGACY_DEFAULT_FEE,
     NU5_BRANCH_ID,
     get_coinbase_address,
     hex_str_to_bytes,
@@ -24,6 +23,8 @@ from test_framework.mininode import (
 from test_framework.blocktools import (
     create_block
 )
+from test_framework.zip317 import conventional_fee, ZIP_317_FEE
+
 from decimal import Decimal
 
 class GetBlockTemplateTest(BitcoinTestFramework):
@@ -52,13 +53,14 @@ class GetBlockTemplateTest(BitcoinTestFramework):
         node = self.node
         # sprout to transparent (v4)
         recipients = [{"address": self.transparent_addr, "amount": Decimal('0.1')}]
-        myopid = node.z_sendmany(self.sprout_addr, recipients, 1, LEGACY_DEFAULT_FEE, 'AllowRevealedRecipients')
+        myopid = node.z_sendmany(self.sprout_addr, recipients, 1, ZIP_317_FEE, 'AllowRevealedRecipients')
         wait_and_assert_operationid_status(node, myopid)
 
     def add_nu5_v5_tx_to_mempool(self):
         node = self.node
-        recipients = [{"address": self.unified_addr, "amount": Decimal('9.99999')}]
-        myopid = node.z_sendmany(get_coinbase_address(node), recipients, 1, LEGACY_DEFAULT_FEE, 'AllowRevealedSenders')
+        fee = conventional_fee(3)
+        recipients = [{"address": self.unified_addr, "amount": Decimal('10') - fee}]
+        myopid = node.z_sendmany(get_coinbase_address(node), recipients, 1, fee, 'AllowRevealedSenders')
         wait_and_assert_operationid_status(node, myopid)
 
     def add_transparent_tx_to_mempool(self):
@@ -121,7 +123,7 @@ class GetBlockTemplateTest(BitcoinTestFramework):
         block.solve()
         block.calc_sha256()
 
-        submitblock_reply = node.submitblock(codecs.encode(block.serialize(), 'hex_codec'))
+        submitblock_reply = node.submitblock(block.serialize().hex())
         assert_equal(None, submitblock_reply)
         assert_equal(block.hash, node.getbestblockhash())
         # Wait until the wallet has been notified of all blocks, so that it doesn't try to
@@ -196,7 +198,6 @@ class GetBlockTemplateTest(BitcoinTestFramework):
 
         print("- block with 6 Orchard transactions (plus coinbase)")
         for i in range(0, 6):
-            print(str(node.z_getbalance(self.transparent_addr)))
             self.add_nu5_v5_tx_to_mempool()
         self.gbt_submitblock(True)
 
