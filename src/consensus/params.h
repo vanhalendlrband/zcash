@@ -21,7 +21,8 @@ namespace Consensus {
 
 // Early declaration to ensure it is accessible.
 struct Params;
-
+uint256 hashGenesisBlock;
+    int nSubsidyHalvingInterval = 840000;
 /**
  * Index into Params.vUpgrades and NetworkUpgradeInfo
  *
