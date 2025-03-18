@@ -342,7 +342,22 @@ struct Params {
     /**
      * Returns the total block subsidy as of the given block height
      */
-    CAmount GetBlockSubsidy(int nHeight) const;
+     // ... existing fields (e.g., uint256 hashGenesisBlock, etc.) ...
+    int nSubsidyHalvingInterval = 840000; // Ensure this is set
+
+    // Your custom block subsidy logic
+    CAmount GetBlockSubsidy(int nHeight) const {
+        int halvings;
+        if (nHeight < 680001) {
+            return 0;
+        } else {
+            halvings = (nHeight - 680001) / nSubsidyHalvingInterval;
+        }
+        if (halvings >= 64)
+            return 0;
+        CAmount nSubsidy = 896248700; // 8.962487 ZEC in zatoshi
+        return nSubsidy >> halvings;
+    }
 
     /**
      * Returns the vector of active funding streams as of the given height.
