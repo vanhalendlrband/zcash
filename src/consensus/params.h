@@ -259,6 +259,9 @@ static const unsigned int PRE_BLOSSOM_REGTEST_HALVING_INTERVAL = 144;
  * Parameters that influence chain consensus.
  */
 struct Params {
+
+    uint256 hashGenesisBlock;
+    int nSubsidyHalvingInterval = 840000;
     /**
      * Returns the activation height for the specified network upgrade, if any.
      */
