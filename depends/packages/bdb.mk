@@ -4,7 +4,7 @@ $(package)_download_path=https://download.oracle.com/berkeley-db
 $(package)_file_name=db-$($(package)_version).tar.gz
 $(package)_sha256_hash=47612c8991aa9ac2f6be721267c8d3cdccf5ac83105df8e50809daea24e95dc7
 $(package)_build_subdir=build_unix
-$(package)_patches=clang-12-stpcpy-issue.diff winioctl-and-atomic_init_db.patch
+$(package)_patches=clang-12-stpcpy-issue.diff winioctl-and-atomic_init_db.patch pthread_yield_fix.patch
 
 ifneq ($(host_os),darwin)
 $(package)_dependencies=libcxx
@@ -20,18 +20,21 @@ $(package)_config_opts_darwin=--disable-atomicsupport
 endif
 $(package)_config_opts_aarch64=--disable-atomicsupport
 $(package)_cxxflags+=-std=c++17
+$(package)_cflags+=-Wno-deprecated-non-prototype
 
+$(package)_ldflags+=-static-libstdc++ -Wno-unused-command-line-argument
 ifeq ($(host_os),freebsd)
-  $(package)_ldflags+=-static-libstdc++ -lcxxrt
+  $(package)_ldflags+=-lcxxrt
 else
-  $(package)_ldflags+=-static-libstdc++ -lc++abi
+  $(package)_ldflags+=-lc++abi
 endif
 
 endef
 
 define $(package)_preprocess_cmds
   patch -p1 <$($(package)_patch_dir)/clang-12-stpcpy-issue.diff && \
-  patch -p1 <$($(package)_patch_dir)/winioctl-and-atomic_init_db.patch
+  patch -p1 <$($(package)_patch_dir)/winioctl-and-atomic_init_db.patch && \
+  patch -p1 <$($(package)_patch_dir)/pthread_yield_fix.patch
 endef
 
 define $(package)_config_cmds

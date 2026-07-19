@@ -1,3 +1,159 @@
+zcash (6.20.0) stable; urgency=critical
+
+  * 6.20.0 release.
+
+ -- Zcash Open Development Lab <sysadmin@zodl.com>  Tue, 02 Jun 2026 19:58:54 +0000
+
+zcash (6.12.5) stable; urgency=critical
+
+  * 6.12.5 release.
+
+ -- Zcash Open Development Lab <sysadmin@zodl.com>  Mon, 01 Jun 2026 20:21:04 -0600
+
+zcash (6.12.4) stable; urgency=critical
+
+  * 6.12.4 release.
+
+ -- Zcash Open Development Lab <sysadmin@zodl.com>  Mon, 01 Jun 2026 16:15:10 -0600
+
+zcash (6.12.3) stable; urgency=critical
+
+  * 6.12.3 release.
+
+ -- Zcash Open Development Lab <team@zodl.com>  Thu, 07 May 2026 13:05:39 -0600
+
+zcash (6.12.2) stable; urgency=high
+
+  * 6.12.2 release.
+
+ -- Zcash Open Development Lab <team@zodl.com>  Wed, 06 May 2026 07:47:32 -0600
+
+zcash (6.12.1) stable; urgency=high
+
+  * 6.12.1 release.
+
+ -- Zcash Open Development Lab <team@zodl.com>  Fri, 17 Apr 2026 10:32:00 -0600
+
+zcash (6.12.0) stable; urgency=medium
+
+  * 6.12.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Fri, 27 Mar 2026 15:42:33 -0600
+
+zcash (6.11.0) stable; urgency=medium
+
+  * 6.11.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 08 Jan 2026 13:02:54 -0700
+
+zcash (6.10.0) stable; urgency=medium
+
+  * 6.10.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 01 Oct 2025 10:44:24 -0600
+
+zcash (6.3.0) stable; urgency=medium
+
+  * 6.3.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 31 Jul 2025 20:10:24 +0000
+
+zcash (6.3.0~rc1) stable; urgency=medium
+
+  * 6.3.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 30 Jul 2025 23:14:42 +0000
+
+zcash (6.2.0) stable; urgency=medium
+
+  * 6.2.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 16 Apr 2025 23:59:38 +0100
+
+zcash (6.2.0~rc1) stable; urgency=medium
+
+  * 6.2.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 10 Apr 2025 18:44:12 +0100
+
+zcash (6.1.0) stable; urgency=medium
+
+  * 6.1.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 02 Jan 2025 19:21:42 +0000
+
+zcash (6.0.0) stable; urgency=high
+
+  * 6.0.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 02 Oct 2024 20:45:09 +0000
+
+zcash (6.0.0~rc1) stable; urgency=medium
+
+  * 6.0.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Fri, 27 Sep 2024 19:51:34 +0000
+
+zcash (5.10.0) stable; urgency=medium
+
+  * 5.10.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Tue, 27 Aug 2024 10:40:33 -0600
+
+zcash (5.10.0~rc1) stable; urgency=medium
+
+  * 5.10.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 21 Aug 2024 22:55:30 -0600
+
+zcash (5.9.1) stable; urgency=medium
+
+  * 5.9.1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 23 May 2024 12:56:26 -0600
+
+zcash (5.9.1~rc1) stable; urgency=medium
+
+  * 5.9.1-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 22 May 2024 10:36:47 -0600
+
+zcash (5.9.0) stable; urgency=medium
+
+  * 5.9.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Fri, 19 Apr 2024 18:30:48 +0000
+
+zcash (5.9.0~rc1) stable; urgency=medium
+
+  * 5.9.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Wed, 17 Apr 2024 22:49:17 +0000
+
+zcash (5.8.0) stable; urgency=medium
+
+  * 5.8.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Tue, 02 Jan 2024 19:19:15 +0000
+
+zcash (5.8.0~rc1) stable; urgency=medium
+
+  * 5.8.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 21 Dec 2023 16:56:50 +0000
+
+zcash (5.7.0) stable; urgency=medium
+
+  * 5.7.0 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Thu, 28 Sep 2023 18:22:50 +0000
+
+zcash (5.7.0~rc1) stable; urgency=medium
+
+  * 5.7.0-rc1 release.
+
+ -- Electric Coin Company <team@electriccoin.co>  Fri, 22 Sep 2023 20:31:30 +0000
+
 zcash (5.6.1) stable; urgency=medium
 
   * 5.6.1 release.

@@ -33,6 +33,7 @@
 #include "transaction_builder.h"
 #include "ui_interface.h"
 #include "util/system.h"
+#include "util/match.h"
 #include "util/moneystr.h"
 #include "validationinterface.h"
 #include "zip317.h"
@@ -74,6 +75,7 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
         nNewTime = std::min(nNewTime, medianTimePast + MAX_FUTURE_BLOCK_TIME_MTP);
     }
 
+    // The timestamp of a given block template should not go backwards.
     if (nOldTime < nNewTime)
         pblock->nTime = nNewTime;
 
@@ -88,34 +90,6 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
 bool IsShieldedMinerAddress(const MinerAddress& minerAddr) {
     return !std::holds_alternative<boost::shared_ptr<CReserveScript>>(minerAddr);
 }
-
-class AddFundingStreamValueToTx
-{
-private:
-    CMutableTransaction &mtx;
-    sapling::Builder& saplingBuilder;
-    const CAmount fundingStreamValue;
-    const libzcash::Zip212Enabled zip212Enabled;
-public:
-    AddFundingStreamValueToTx(
-            CMutableTransaction &mtx,
-            sapling::Builder& saplingBuilder,
-            const CAmount fundingStreamValue,
-            const libzcash::Zip212Enabled zip212Enabled): mtx(mtx), saplingBuilder(saplingBuilder), fundingStreamValue(fundingStreamValue), zip212Enabled(zip212Enabled) {}
-
-    void operator()(const libzcash::SaplingPaymentAddress& pa) const {
-        saplingBuilder.add_recipient(
-            {},
-            pa.GetRawBytes(),
-            fundingStreamValue,
-            libzcash::Memo::ToBytes(std::nullopt));
-    }
-
-    void operator()(const CScript& scriptPubKey) const {
-        mtx.vout.push_back(CTxOut(fundingStreamValue, scriptPubKey));
-    }
-};
-
 
 class AddOutputsToCoinbaseTxAndSign
 {
@@ -141,23 +115,38 @@ public:
     }
 
     CAmount SetFoundersRewardAndGetMinerValue(sapling::Builder& saplingBuilder) const {
-        auto block_subsidy = GetBlockSubsidy(nHeight, chainparams.GetConsensus());
+        const auto& consensus = chainparams.GetConsensus();
+        const auto block_subsidy = consensus.GetBlockSubsidy(nHeight);
         auto miner_reward = block_subsidy; // founders' reward or funding stream amounts will be subtracted below
 
         if (nHeight > 0) {
             if (chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY)) {
-                auto fundingStreamElements = Consensus::GetActiveFundingStreamElements(
-                    nHeight,
-                    block_subsidy,
-                    chainparams.GetConsensus());
+                LogPrint("pow", "%s: Constructing funding stream outputs for height %d", __func__, nHeight);
+                for (const auto& [fsinfo, fs] : consensus.GetActiveFundingStreams(nHeight)) {
+                    const auto amount = fsinfo.Value(block_subsidy);
+                    miner_reward -= amount;
 
-                for (Consensus::FundingStreamElement fselem : fundingStreamElements) {
-                    miner_reward -= fselem.second;
-                    std::visit(AddFundingStreamValueToTx(mtx, saplingBuilder, fselem.second, GetZip212Flag()), fselem.first);
+                    examine(fs.Recipient(consensus, nHeight), match {
+                        [&](const libzcash::SaplingPaymentAddress& pa) {
+                            LogPrint("pow", "%s: Adding Sapling funding stream output of value %d", __func__, amount);
+                            saplingBuilder.add_recipient(
+                                {},
+                                pa.GetRawBytes(),
+                                amount,
+                                libzcash::Memo::ToBytes(std::nullopt));
+                        },
+                        [&](const CScript& scriptPubKey) {
+                            LogPrint("pow", "%s: Adding transparent funding stream output of value %d", __func__, amount);
+                            mtx.vout.emplace_back(amount, scriptPubKey);
+                        },
+                        [&](const Consensus::Lockbox& lockbox) {
+                            LogPrint("pow", "%s: Noting lockbox output of value %d", __func__, amount);
+                        }
+                    });
                 }
             } else if (nHeight <= chainparams.GetConsensus().GetLastFoundersRewardBlockHeight(nHeight)) {
                 // Founders reward is 20% of the block subsidy
-                auto vFoundersReward = miner_reward / 5;
+                const auto vFoundersReward = miner_reward / 5;
                 // Take some reward away from us
                 miner_reward -= vFoundersReward;
                 // And give it to the founders
@@ -166,44 +155,54 @@ public:
                 // Founders reward ends without replacement if Canopy is not activated by the
                 // last Founders' Reward block height + 1.
             }
+
+            if (chainparams.GetConsensus().NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU6_1)) {
+                auto disbursements = consensus.GetLockboxDisbursementsForHeight(nHeight);
+                if (!disbursements.empty()) {
+                    LogPrint("pow", "%s: Constructing one-time lockbox disbursement outputs for height %d", __func__, nHeight);
+                    for (const auto& disbursement : disbursements) {
+                        LogPrint("pow", "%s: Adding transparent lockbox disbursement output of value %d",
+                                 __func__, disbursement.GetAmount());
+                        mtx.vout.emplace_back(disbursement.GetAmount(), disbursement.GetRecipient());
+                    }
+                }
+            }
         }
+        LogPrint("pow", "%s: Miner reward at height %d is %d", __func__, nHeight, miner_reward);
 
         return miner_reward + nFees;
     }
 
     void ComputeBindingSig(rust::Box<sapling::Builder> saplingBuilder, std::optional<orchard::UnauthorizedBundle> orchardBundle) const {
         auto consensusBranchId = CurrentEpochBranchId(nHeight, chainparams.GetConsensus());
-        auto saplingBundle = sapling::build_bundle(std::move(saplingBuilder), nHeight);
+        auto saplingBundle = sapling::build_bundle(std::move(saplingBuilder));
 
         // Empty output script.
         uint256 dataToBeSigned;
-        try {
-            if (mtx.fOverwintered) {
-                // ProduceShieldedSignatureHash is only usable with v3+ transactions.
-                dataToBeSigned = ProduceShieldedSignatureHash(
-                    consensusBranchId,
-                    mtx,
-                    {},
-                    *saplingBundle,
-                    orchardBundle);
-            } else {
-                CScript scriptCode;
-                PrecomputedTransactionData txdata(mtx, {});
-                dataToBeSigned = SignatureHash(
-                    scriptCode, mtx, NOT_AN_INPUT, SIGHASH_ALL, 0,
-                    consensusBranchId,
-                    txdata);
-            }
-        } catch (std::logic_error ex) {
-            throw ex;
+        if (mtx.fOverwintered) {
+            // ProduceShieldedSignatureHash is only usable with v3+ transactions.
+            dataToBeSigned = ProduceShieldedSignatureHash(
+                consensusBranchId,
+                mtx,
+                {},
+                *saplingBundle,
+                orchardBundle);
+        } else {
+            CScript scriptCode;
+            PrecomputedTransactionData txdata(mtx, {});
+            dataToBeSigned = SignatureHash(
+                scriptCode, mtx, NOT_AN_INPUT, SIGHASH_ALL, 0,
+                consensusBranchId,
+                txdata);
         }
 
         if (orchardBundle.has_value()) {
+            // The bundle proves against the circuit version its builder was created with.
             auto authorizedBundle = orchardBundle.value().ProveAndSign({}, dataToBeSigned);
             if (authorizedBundle.has_value()) {
                 mtx.orchardBundle = authorizedBundle.value();
             } else {
-                throw new std::runtime_error("Failed to create Orchard proof or signatures");
+                throw std::runtime_error("Failed to create Orchard proof or signatures");
             }
         }
 
@@ -213,13 +212,16 @@ public:
 
     // Create Orchard output
     void operator()(const libzcash::OrchardRawAddress &to) const {
-        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight);
+        std::array<uint8_t, 32> saplingAnchor;
+        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight, saplingAnchor, true);
 
         // `enableSpends` must be set to `false` for coinbase transactions. This
         // means the Orchard anchor is unconstrained, so we set it to the empty
         // tree root via a null (all zeroes) uint256.
         uint256 orchardAnchor;
-        auto builder = orchard::Builder(false, true, orchardAnchor);
+        // Choose the Orchard circuit to prove against (see CChainParams::UseFixedCircuitForProving).
+        bool useFixedCircuitForProving = chainparams.UseFixedCircuitForProving(nHeight);
+        auto builder = orchard::Builder(true, orchardAnchor, useFixedCircuitForProving);
 
         // Shielded coinbase outputs must be recoverable with an all-zeroes ovk.
         uint256 ovk;
@@ -241,7 +243,7 @@ public:
 
         auto bundle = builder.Build();
         if (!bundle.has_value()) {
-            throw new std::runtime_error("Failed to create shielded output for miner");
+            throw std::runtime_error("Failed to create shielded output for miner");
         }
 
         ComputeBindingSig(std::move(saplingBuilder), std::move(bundle));
@@ -249,7 +251,8 @@ public:
 
     // Create Sapling output
     void operator()(const libzcash::SaplingPaymentAddress &pa) const {
-        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight);
+        std::array<uint8_t, 32> saplingAnchor;
+        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight, saplingAnchor, true);
 
         auto miner_reward = SetFoundersRewardAndGetMinerValue(*saplingBuilder);
 
@@ -265,7 +268,8 @@ public:
     // Create transparent output
     void operator()(const boost::shared_ptr<CReserveScript> &coinbaseScript) const {
         // Add the FR output and fetch the miner's output value.
-        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight);
+        std::array<uint8_t, 32> saplingAnchor;
+        auto saplingBuilder = sapling::new_builder(*chainparams.RustNetwork(), nHeight, saplingAnchor, true);
 
         // Miner output will be vout[0]; Founders' Reward & funding stream outputs
         // will follow.
@@ -336,7 +340,6 @@ void BlockAssembler::resetBlock(const MinerAddress& minerAddress)
     sproutValue = 0;
     saplingValue = 0;
     orchardValue = 0;
-    monitoring_pool_balances = true;
 
     lastFewTxs = 0;
     blockFinished = false;
@@ -373,7 +376,11 @@ CBlockTemplate* BlockAssembler::CreateNewBlock(
     if (chainparams.MineBlocksOnDemand())
         pblock->nVersion = GetArg("-blockversion", pblock->nVersion);
 
-    pblock->nTime = GetTime();
+    // Setting nTime to 0 and then calling UpdateTime ensures that it is set to the
+    // nearest timestamp to the current time in the consensus-valid range (see #6960).
+    pblock->nTime = 0;
+    UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+
     const int64_t nMedianTimePast = pindexPrev->GetMedianTimePast();
     CCoinsViewCache view(pcoinsTip);
 
@@ -384,28 +391,28 @@ CBlockTemplate* BlockAssembler::CreateNewBlock(
                        ? nMedianTimePast
                        : pblock->GetBlockTime();
 
-    // We want to track the value pool, but if the miner gets
-    // invoked on an old block before the hardcoded fallback
-    // is active we don't want to trip up any assertions. So,
-    // we only adhere to the turnstile (as a miner) if we
-    // actually have all of the information necessary to do
-    // so.
+    // Track the chain pool value pool balances for turnstile enforcement.
+    //
+    // `pindexPrev` is `chainActive.Tip()` (set above), and the active tip is
+    // guaranteed to have populated chain pool values:
+    //
+    // - For Sapling and Orchard, `ConnectBlock` asserts via
+    //   `assert(pindex->nChain*Value.has_value())` that these are populated;
+    //   the active tip could not have been set otherwise.
+    // - For Sprout, `ConnectBlock` halts with a "reindex required" message
+    //   via `AbortNode` if `nChainSproutValue` is missing (which only
+    //   happens with legacy block index data written by clients older than
+    //   `SPROUT_VALUE_VERSION`); the active tip could not have been
+    //   advanced past such a state without the user reindexing first.
+    //
+    // Therefore the assertions below cannot fail in any reachable state.
     if (chainparams.ZIP209Enabled()) {
-        if (pindexPrev->nChainSproutValue) {
-            sproutValue = *pindexPrev->nChainSproutValue;
-        } else {
-            monitoring_pool_balances = false;
-        }
-        if (pindexPrev->nChainSaplingValue) {
-            saplingValue = *pindexPrev->nChainSaplingValue;
-        } else {
-            monitoring_pool_balances = false;
-        }
-        if (pindexPrev->nChainOrchardValue) {
-            orchardValue = *pindexPrev->nChainOrchardValue;
-        } else {
-            monitoring_pool_balances = false;
-        }
+        assert(pindexPrev->nChainSproutValue.has_value());
+        assert(pindexPrev->nChainSaplingValue.has_value());
+        assert(pindexPrev->nChainOrchardValue.has_value());
+        sproutValue = pindexPrev->nChainSproutValue.value();
+        saplingValue = pindexPrev->nChainSaplingValue.value();
+        orchardValue = pindexPrev->nChainOrchardValue.value();
     }
 
     constructZIP317BlockTemplate();
@@ -482,8 +489,8 @@ CBlockTemplate* BlockAssembler::CreateNewBlock(
     pblocktemplate->vTxSigOps[0] = GetLegacySigOpCount(pblock->vtx[0]);
 
     CValidationState state;
-    if (!TestBlockValidity(state, chainparams, *pblock, pindexPrev, true)) {
-        throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, FormatStateMessage(state)));
+    if (!TestNewBlockAtTipValidity(state, chainparams, *pblock, true)) {
+        throw std::runtime_error(strprintf("%s: TestNewBlockAtTipValidity failed: %s", __func__, FormatStateMessage(state)));
     }
 
     return pblocktemplate.release();
@@ -550,7 +557,7 @@ bool BlockAssembler::TestForBlock(CTxMemPool::txiter iter)
     if (IsExpiredTx(iter->GetTx(), nHeight))
         return false;
 
-    if (chainparams.ZIP209Enabled() && monitoring_pool_balances) {
+    if (chainparams.ZIP209Enabled()) {
         // Does this transaction lead to a turnstile violation?
 
         CAmount sproutValueDummy = sproutValue;

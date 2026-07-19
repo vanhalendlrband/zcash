@@ -137,6 +137,13 @@ void CTransaction::UpdateHash() const
 {
     CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
     ss << *this;
+    // CONSENSUS: `zcash_transaction_digests` reparses the serialized transaction through
+    // librustzcash, which enforces consensus encoding rules (e.g. canonical Orchard element
+    // encodings, and from NU6.2 the canonical Orchard proof size, keyed on the transaction's
+    // own v5+ consensus branch id; see `zcash_transaction_digests` in src/rust/src/
+    // transaction_ffi.rs). This runs on construction of every CTransaction, so the throw
+    // below is how those rules reject a malformed transaction. Do not weaken this throw or
+    // skip the reparse on the assumption it is only computing hashes.
     if (!zcash_transaction_digests(
         reinterpret_cast<const unsigned char*>(ss.data()),
         ss.size(),
@@ -227,7 +234,7 @@ CAmount CTransaction::GetValueOut() const
     auto valueBalanceSapling = saplingBundle.GetValueBalance();
     if (valueBalanceSapling <= 0) {
         // NB: negative valueBalanceSapling "takes" money from the transparent value pool just as outputs do
-        if (valueBalanceSapling < -MAX_MONEY) {
+        if (!MoneyDeltaRange(valueBalanceSapling)) {
             throw std::runtime_error("CTransaction::GetValueOut(): valueBalanceSapling out of range");
         }
         nValueOut += -valueBalanceSapling;
@@ -240,7 +247,7 @@ CAmount CTransaction::GetValueOut() const
     auto valueBalanceOrchard = orchardBundle.GetValueBalance();
     if (valueBalanceOrchard <= 0) {
         // NB: negative valueBalanceOrchard "takes" money from the transparent value pool just as outputs do
-        if (valueBalanceOrchard < -MAX_MONEY) {
+        if (!MoneyDeltaRange(valueBalanceOrchard)) {
             throw std::runtime_error("CTransaction::GetValueOut(): valueBalanceOrchard out of range");
         }
         nValueOut += -valueBalanceOrchard;

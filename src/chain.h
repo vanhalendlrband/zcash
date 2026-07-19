@@ -24,6 +24,7 @@ static const int SAPLING_VALUE_VERSION = 1010100;
 static const int CHAIN_HISTORY_ROOT_VERSION = 2010200;
 static const int NU5_DATA_VERSION = 4050000;
 static const int TRANSPARENT_VALUE_VERSION = 5040026;
+static const int NU6_DATA_VERSION = 5100025;
 
 /**
  * Maximum amount of time that a block timestamp is allowed to be ahead of the
@@ -156,22 +157,32 @@ enum BlockStatus: uint32_t {
     BLOCK_VALID_TREE         =    2,
 
     /**
-     * Only first tx is coinbase, 2 <= coinbase input script length <= 100, transactions valid, no duplicate txids,
-     * sigops, size, merkle root. Implies all parents are at least TREE but not necessarily TRANSACTIONS. When all
-     * parent blocks also have TRANSACTIONS, CBlockIndex::nChainTx will be set.
+     * Only first tx is coinbase, 2 <= coinbase input script length <= 100, transactions partially valid (see
+     * below), no duplicate txids, sigops, size, merkle root. Implies all parents are at least TREE but not
+     * necessarily PARTIALLY_VALID_TRANSACTIONS. When all parent blocks also have PARTIALLY_VALID_TRANSACTIONS,
+     * CBlockIndex::nChainTx will be set.
+     *
+     * "Partially valid" means that the non-contextual checks performed by `CheckBlock` have passed, but
+     * shielded proofs (Sprout JoinSplit, Sapling Spend/Output, Orchard Action) and signatures have NOT yet
+     * been verified at this validity level. Those are deferred to `ConnectBlock` (which raises validity to
+     * `BLOCK_VALID_CONSENSUS`) for performance reasons (so that proofs are verified at most once, just
+     * before the block is connected to the active chain).
      */
-    BLOCK_VALID_TRANSACTIONS =    3,
+    BLOCK_PARTIALLY_VALID_TRANSACTIONS = 3,
 
     //! Outputs do not overspend inputs, no double spends, coinbase output ok, no immature coinbase spends, BIP30.
     //! Implies all parents are also at least CHAIN.
     BLOCK_VALID_CHAIN        =    4,
 
-    //! Scripts & signatures ok. Implies all parents are also at least SCRIPTS.
-    BLOCK_VALID_SCRIPTS      =    5,
+    //! All consensus rules satisfied: transparent script execution, shielded proofs (Sprout JoinSplit,
+    //! Sapling Spend/Output, Orchard Action), shielded signatures, turnstile/lockbox checks, and all
+    //! other consensus checks performed in `ConnectBlock`. Implies all parents are also at least
+    //! CONSENSUS.
+    BLOCK_VALID_CONSENSUS    =    5,
 
     //! All validity bits.
-    BLOCK_VALID_MASK         =   BLOCK_VALID_HEADER | BLOCK_VALID_TREE | BLOCK_VALID_TRANSACTIONS |
-                                 BLOCK_VALID_CHAIN | BLOCK_VALID_SCRIPTS,
+    BLOCK_VALID_MASK         =   BLOCK_VALID_HEADER | BLOCK_VALID_TREE | BLOCK_PARTIALLY_VALID_TRANSACTIONS |
+                                 BLOCK_VALID_CHAIN | BLOCK_VALID_CONSENSUS,
 
     BLOCK_HAVE_DATA          =    8, //! full block available in blk*.dat
     BLOCK_HAVE_UNDO          =   16, //! undo data available in rev*.dat
@@ -183,10 +194,6 @@ enum BlockStatus: uint32_t {
 
     BLOCK_ACTIVATES_UPGRADE  =   128, //! block activates a network upgrade
 };
-
-//! Short-hand for the highest consensus validity we implement.
-//! Blocks with this validity are assumed to satisfy all consensus rules.
-static const BlockStatus BLOCK_VALID_CONSENSUS = BLOCK_VALID_SCRIPTS;
 
 /** The block chain is a tree shaped structure starting with the
  * genesis block at the root, with each block potentially having multiple
@@ -307,6 +314,17 @@ public:
     //! Will be std::nullopt if and only if nChainTx is zero.
     std::optional<CAmount> nChainOrchardValue;
 
+    //! Change in value held by the development fund lockbox over this block.
+    //!
+    //! Not a std::optional because this is added before NU6 activation, so we can
+    //! rely on the invariant that every block before this was added had nLockboxValue = 0.
+    CAmount nLockboxValue;
+
+    //! (memory only) Total value held by the development fund lockbox up to
+    //! and including this block. Will be std::nullopt if and only if nChainTx
+    //! is zero.
+    std::optional<CAmount> nChainLockboxValue;
+
     //! Root of the Sapling commitment tree as of the end of this block.
     //!
     //! - For blocks prior to (not including) the Heartwood activation block, this is
@@ -377,6 +395,9 @@ public:
         nChainTotalSupply = std::nullopt;
         nTransparentValue = std::nullopt;
         nChainTransparentValue = std::nullopt;
+        nLockboxValue = 0;
+        nChainLockboxValue = std::nullopt;
+
         nSproutValue = std::nullopt;
         nChainSproutValue = std::nullopt;
         nSaplingValue = 0;
@@ -391,6 +412,61 @@ public:
         nBits          = 0;
         nNonce         = uint256();
         nSolution.clear();
+    }
+
+    //! Reset all body-related state on this block index entry, leaving header
+    //! and tree-position fields (`phashBlock`, `pprev`, `pskip`, `nHeight`,
+    //! `nChainWork`, `nCachedBranchId`, the deserialized header) intact.
+    //! Lowers the validity ladder back to `BLOCK_VALID_TREE` to reflect that
+    //! the body data is gone but the header remains validated up to where
+    //! `AcceptBlockHeader` left it. Used by `InvalidBlockFound` when
+    //! `CValidationState::CorruptionPossible()` is set, to discard body data
+    //! persisted from a body/header mismatch so that a subsequent submission
+    //! of a matching body for the same header can be processed normally.
+    //!
+    //! Preconditions, enforced by callers:
+    //!
+    //!   - Validity is at least `BLOCK_VALID_TREE`.
+    //!   - This entry is not in `setBlockIndexCandidates`.
+    //!   - No descendant of this entry has `nChainTx > 0`. Setting
+    //!     `nChainTx` to 0 here while a descendant retains `nChainTx > 0`
+    //!     would violate `CheckBlockIndex`'s `pindexFirstNeverProcessed`
+    //!     invariant on each such descendant: after the reset, the
+    //!     descendant's walk-tracker becomes set to this entry (because we
+    //!     now have `nTx == 0`), but the descendant's own `nChainTx` is
+    //!     still nonzero, breaking the equivalence between
+    //!     `pindexFirstNeverProcessed != NULL` and `nChainTx == 0`. Callers
+    //!     that may have such descendants must reset the descendant subtree
+    //!     (post-order) before this entry.
+    void ResetBodyState()
+    {
+        assert((nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TREE);
+        nStatus = (nStatus & ~(BLOCK_VALID_MASK | BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO)) | BLOCK_VALID_TREE;
+        nFile = 0;
+        nDataPos = 0;
+        nUndoPos = 0;
+        nTx = 0;
+        nChainTx = 0;
+        // `CheckBlockIndex` invariant: `nChainTx == 0` implies `nSequenceId == 0`.
+        nSequenceId = 0;
+        nChainSupplyDelta = std::nullopt;
+        nTransparentValue = std::nullopt;
+        nChainTotalSupply = std::nullopt;
+        nChainTransparentValue = std::nullopt;
+        nSproutValue = std::nullopt;
+        nChainSproutValue = std::nullopt;
+        nSaplingValue = 0;
+        nChainSaplingValue = std::nullopt;
+        nOrchardValue = 0;
+        nChainOrchardValue = std::nullopt;
+        nLockboxValue = 0;
+        nChainLockboxValue = std::nullopt;
+        hashSproutAnchor = uint256();
+        hashFinalSproutRoot = uint256();
+        hashFinalSaplingRoot = uint256();
+        hashAuthDataRoot = uint256();
+        hashFinalOrchardRoot = uint256();
+        hashChainHistoryRoot = uint256();
     }
 
     CBlockIndex()
@@ -473,7 +549,7 @@ public:
     }
 
     //! Check whether this block index entry is valid up to the passed validity level.
-    bool IsValid(enum BlockStatus nUpTo = BLOCK_VALID_TRANSACTIONS) const
+    bool IsValid(enum BlockStatus nUpTo = BLOCK_PARTIALLY_VALID_TRANSACTIONS) const
     {
         assert(!(nUpTo & ~BLOCK_VALID_MASK)); // Only validity flags allowed.
         if (nStatus & BLOCK_FAILED_MASK)
@@ -611,6 +687,13 @@ public:
             READWRITE(hashAuthDataRoot);
             READWRITE(hashFinalOrchardRoot);
             READWRITE(nOrchardValue);
+        }
+
+        // Only read/write NU6 data if the client version used to create this
+        // index was storing them. For block indices written before the client
+        // was NU6-aware, these are always null / zero.
+        if ((s.GetType() & SER_DISK) && (nVersion >= NU6_DATA_VERSION)) {
+            READWRITE(nLockboxValue);
         }
 
         // If you have just added new serialized fields above, remember to add

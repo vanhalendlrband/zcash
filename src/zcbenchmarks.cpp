@@ -44,7 +44,7 @@ void pre_wallet_load()
 {
     LogPrintf("%s: In progress...\n", __func__);
     if (ShutdownRequested())
-        throw new std::runtime_error("The node is shutting down");
+        throw std::runtime_error("The node is shutting down");
 
     if (pwalletMain)
         pwalletMain->Flush(false);
@@ -86,6 +86,25 @@ double timer_stop(timeval &tv_start)
     elapsed = double(tv_end.tv_sec-tv_start.tv_sec) +
         (tv_end.tv_usec-tv_start.tv_usec)/double(1000000);
     return elapsed;
+}
+
+// Override `block.hashBlockCommitments` so the NU5+ check inside
+// `ConnectBlock` passes against a synthetic `FakeCoinsViewDB`-backed
+// view, which does not reproduce the chain-history MMR state at the
+// benchmark height. No-op for pre-NU5 blocks. Callers should invoke
+// outside the timed region.
+static void recompute_hash_block_commitments(
+    CBlock& block,
+    const CBlockIndex& index,
+    const CCoinsViewCache& view)
+{
+    const auto& consensusParams = Params().GetConsensus();
+    if (consensusParams.NetworkUpgradeActive(index.nHeight, Consensus::UPGRADE_NU5)) {
+        auto prevBranch = CurrentEpochBranchId(index.nHeight - 1, consensusParams);
+        block.hashBlockCommitments = DeriveBlockCommitmentsHash(
+            view.GetHistoryRoot(prevBranch),
+            block.BuildAuthDataMerkleTree());
+    }
 }
 
 double benchmark_sleep()
@@ -538,7 +557,7 @@ public:
             case ORCHARD:
                 return orchardTrees[0].root();
             default:
-                throw new std::runtime_error("Unknown shielded type");
+                throw std::runtime_error("Unknown shielded type");
         }
     }
 
@@ -579,7 +598,7 @@ double benchmark_connectblock_slow()
     SelectParams(CBaseChainParams::MAIN);
     CBlock block;
     FILE* fp = fsbridge::fopen(GetDataDir() / "benchmark/block-107134.dat", "rb");
-    if (!fp) throw new std::runtime_error("Failed to open block data file");
+    if (!fp) throw std::runtime_error("Failed to open block data file");
     CAutoFile blkFile(fp, SER_DISK, CLIENT_VERSION);
     blkFile >> block;
     blkFile.fclose();
@@ -597,6 +616,18 @@ double benchmark_connectblock_slow()
     indexPrev.nHeight = index.nHeight - 1;
     index.pprev = &indexPrev;
     mapBlockIndex.insert(std::make_pair(hashPrev, &indexPrev));
+
+    // Populate chain pool values on the fake `index` so that ConnectBlock's
+    // turnstile assertions don't fire. Benchmarks measure ConnectBlock
+    // performance, not chain value accumulation — we use MAX_MONEY as a
+    // synthetic baseline large enough that the block's shielded deltas
+    // (positive or negative) cannot push any pool balance negative.
+    index.nChainSproutValue = MAX_MONEY;
+    index.nChainSaplingValue = MAX_MONEY;
+    index.nChainOrchardValue = MAX_MONEY;
+    index.nChainLockboxValue = MAX_MONEY;
+
+    recompute_hash_block_commitments(block, index, view);
 
     CValidationState state;
     struct timeval tv_start;
@@ -617,7 +648,7 @@ double benchmark_connectblock_sapling()
     SelectParams(CBaseChainParams::MAIN);
     CBlock block;
     FILE* fp = fsbridge::fopen(GetDataDir() / "benchmark/block-1723244.dat", "rb");
-    if (!fp) throw new std::runtime_error("Failed to open block data file");
+    if (!fp) throw std::runtime_error("Failed to open block data file");
     CAutoFile blkFile(fp, SER_DISK, CLIENT_VERSION);
     blkFile >> block;
     blkFile.fclose();
@@ -649,6 +680,18 @@ double benchmark_connectblock_sapling()
     index.pprev = &indexPrev;
     mapBlockIndex.insert(std::make_pair(hashPrev, &indexPrev));
 
+    // Populate chain pool values on the fake `index` so that ConnectBlock's
+    // turnstile assertions don't fire. Benchmarks measure ConnectBlock
+    // performance, not chain value accumulation — we use MAX_MONEY as a
+    // synthetic baseline large enough that the block's shielded deltas
+    // (positive or negative) cannot push any pool balance negative.
+    index.nChainSproutValue = MAX_MONEY;
+    index.nChainSaplingValue = MAX_MONEY;
+    index.nChainOrchardValue = MAX_MONEY;
+    index.nChainLockboxValue = MAX_MONEY;
+
+    recompute_hash_block_commitments(block, index, view);
+
     CValidationState state;
     struct timeval tv_start;
     timer_start(tv_start);
@@ -668,7 +711,7 @@ double benchmark_connectblock_orchard()
     SelectParams(CBaseChainParams::MAIN);
     CBlock block;
     FILE* fp = fsbridge::fopen(GetDataDir() / "benchmark/block-1708048.dat", "rb");
-    if (!fp) throw new std::runtime_error("Failed to open block data file");
+    if (!fp) throw std::runtime_error("Failed to open block data file");
     CAutoFile blkFile(fp, SER_DISK, CLIENT_VERSION);
     blkFile >> block;
     blkFile.fclose();
@@ -694,6 +737,18 @@ double benchmark_connectblock_orchard()
     indexPrev.hashFinalOrchardRoot = uint256S("03fa83e2eb5fd7dcf22a413a0226394cb7525c066e7b07f976e7bda75d2eb0a5");
     index.pprev = &indexPrev;
     mapBlockIndex.insert(std::make_pair(hashPrev, &indexPrev));
+
+    // Populate chain pool values on the fake `index` so that ConnectBlock's
+    // turnstile assertions don't fire. Benchmarks measure ConnectBlock
+    // performance, not chain value accumulation — we use MAX_MONEY as a
+    // synthetic baseline large enough that the block's shielded deltas
+    // (positive or negative) cannot push any pool balance negative.
+    index.nChainSproutValue = MAX_MONEY;
+    index.nChainSaplingValue = MAX_MONEY;
+    index.nChainOrchardValue = MAX_MONEY;
+    index.nChainLockboxValue = MAX_MONEY;
+
+    recompute_hash_block_commitments(block, index, view);
 
     CValidationState state;
     struct timeval tv_start;
@@ -759,6 +814,7 @@ double benchmark_create_sapling_spend()
     auto maybe_cmu = note.cmu();
     tree.append(maybe_cmu.value());
     auto witness = tree.witness();
+    auto anchor = tree.root().GetRawBytes();
 
     CDataStream ssExtSk(SER_NETWORK, PROTOCOL_VERSION);
     ssExtSk << sk;
@@ -769,10 +825,9 @@ double benchmark_create_sapling_spend()
     std::move(ss.begin(), ss.end(), witnessChars.begin());
 
     auto nHeight = Params().GetConsensus().vUpgrades[Consensus::UPGRADE_SAPLING].nActivationHeight;
-    auto builder = sapling::new_builder(*Params().RustNetwork(), nHeight);
+    auto builder = sapling::new_builder(*Params().RustNetwork(), nHeight, anchor, false);
     builder->add_spend(
         {reinterpret_cast<uint8_t*>(ssExtSk.data()), ssExtSk.size()},
-        note.d,
         address.GetRawBytes(),
         note.value(),
         note.rcm().GetRawBytes(),
@@ -781,7 +836,7 @@ double benchmark_create_sapling_spend()
     struct timeval tv_start;
     timer_start(tv_start);
 
-    auto result = sapling::build_bundle(std::move(builder), nHeight);
+    auto result = sapling::build_bundle(std::move(builder));
 
     double t = timer_stop(tv_start);
     return t;
@@ -791,9 +846,10 @@ double benchmark_create_sapling_output()
 {
     auto sk = libzcash::SaplingSpendingKey::random();
     auto address = sk.default_address();
+    auto anchor = SaplingMerkleTree::empty_root().GetRawBytes();
 
     auto nHeight = Params().GetConsensus().vUpgrades[Consensus::UPGRADE_SAPLING].nActivationHeight;
-    auto builder = sapling::new_builder(*Params().RustNetwork(), nHeight);
+    auto builder = sapling::new_builder(*Params().RustNetwork(), nHeight, anchor, false);
     builder->add_recipient(
         uint256().GetRawBytes(),
         address.GetRawBytes(),
@@ -803,7 +859,7 @@ double benchmark_create_sapling_output()
     struct timeval tv_start;
     timer_start(tv_start);
 
-    auto result = sapling::build_bundle(std::move(builder), nHeight);
+    auto result = sapling::build_bundle(std::move(builder));
 
     double t = timer_stop(tv_start);
     return t;

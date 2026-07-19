@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2014-2016 The Bitcoin Core developers
-# Copyright (c) 2016-2022 The Zcash developers
+# Copyright (c) 2016-2024 The Zcash developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -31,8 +31,6 @@ from .authproxy import AuthServiceProxy, JSONRPCException
 
 ZCASHD_BINARY = os.path.join('src', 'zcashd')
 
-LEGACY_DEFAULT_FEE = Decimal('0.00001')
-
 COVERAGE_DIR = None
 PRE_BLOSSOM_BLOCK_TARGET_SPACING = 150
 POST_BLOSSOM_BLOCK_TARGET_SPACING = 75
@@ -44,6 +42,9 @@ BLOSSOM_BRANCH_ID = 0x2BB40E60
 HEARTWOOD_BRANCH_ID = 0xF5B9230B
 CANOPY_BRANCH_ID = 0xE9FF75A6
 NU5_BRANCH_ID = 0xC2D6D0B4
+NU6_BRANCH_ID = 0xC8E71055
+NU6_1_BRANCH_ID = 0x4DEC4DF0
+NU6_2_BRANCH_ID = 0x5437F330
 
 # The maximum number of nodes a single test can spawn
 MAX_NODES = 8
@@ -124,6 +125,7 @@ def sync_blocks(rpc_connections, wait=0.125, timeout=60, allow_different_tips=Fa
     the same block count.
     """
     while timeout > 0:
+        assert_bitcoinds_alive()
         if allow_different_tips:
             tips = [ x.getblockcount() for x in rpc_connections ]
         else:
@@ -136,6 +138,7 @@ def sync_blocks(rpc_connections, wait=0.125, timeout=60, allow_different_tips=Fa
     # Now that the block counts are in sync, wait for the internal
     # notifications to finish
     while timeout > 0:
+        assert_bitcoinds_alive()
         notified = [ x.getblockchaininfo()['fullyNotified'] for x in rpc_connections ]
         if notified == [ True ] * len(notified):
             return True
@@ -150,6 +153,7 @@ def sync_mempools(rpc_connections, wait=0.5, timeout=60):
     pools, and has notified all internal listeners of them
     """
     while timeout > 0:
+        assert_bitcoinds_alive()
         pool = set(rpc_connections[0].getrawmempool())
         num_match = 1
         for i in range(1, len(rpc_connections)):
@@ -163,6 +167,7 @@ def sync_mempools(rpc_connections, wait=0.5, timeout=60):
     # Now that the mempools are in sync, wait for the internal
     # notifications to finish
     while timeout > 0:
+        assert_bitcoinds_alive()
         notified = [ x.getmempoolinfo()['fullyNotified'] for x in rpc_connections ]
         if notified == [ True ] * len(notified):
             return True
@@ -172,6 +177,23 @@ def sync_mempools(rpc_connections, wait=0.5, timeout=60):
     raise AssertionError("Mempool sync failed")
 
 bitcoind_processes = {}
+
+
+def assert_bitcoinds_alive():
+    """Raise if any node tracked in `bitcoind_processes` has exited.
+
+    `bitcoind_processes` only contains nodes the framework currently expects
+    to be running: `start_node` adds, `stop_node`/`stop_nodes` remove. So a
+    non-None `poll()` here means a node died on its own (crash, OOM, signal),
+    and any polling loop that calls this helper will fail fast instead of
+    spinning forever against a dead daemon.
+    """
+    for i, proc in bitcoind_processes.items():
+        rc = proc.poll()
+        if rc is not None:
+            raise AssertionError(
+                "node %d (%s, pid %d) exited unexpectedly with returncode %s"
+                % (i, zcashd_binary(), proc.pid, rc))
 
 def initialize_datadir(dirname, n, clock_offset=0):
     datadir = os.path.join(dirname, "node"+str(n))
@@ -186,7 +208,7 @@ def initialize_datadir(dirname, n, clock_offset=0):
         f.write("port="+str(p2p_port(n))+"\n")
         f.write("rpcport="+str(rpc_port(n))+"\n")
         f.write("listenonion=0\n")
-        if clock_offset != 0: 
+        if clock_offset != 0:
             f.write('clockoffset='+str(clock_offset)+'\n')
 
     return datadir
@@ -229,19 +251,19 @@ def wait_for_bitcoind_start(process, url, i):
 def initialize_chain(test_dir, num_nodes, cachedir, cache_behavior='current'):
     """
     Create a set of node datadirs in `test_dir`, based upon the specified
-    `cache_behavior` value. The following values are recognized for 
+    `cache_behavior` value. The following values are recognized for
     `cache_behavior`:
 
     * 'current': create a 200-block-long chain (with wallet) for MAX_NODES
-      in `cachedir` if necessary. Afterward, create num_nodes copies in 
+      in `cachedir` if necessary. Afterward, create num_nodes copies in
       `test_dir` from the cache. The resulting nodes will be configured to
-      use the -clockoffset config argument when starting to ensure that 
+      use the -clockoffset config argument when starting to ensure that
       the cached chain is not treated as being excessively out-of-date.
     * 'sprout': use persisted chain data containing known amounts of Sprout
-      funds from the files in `qa/rpc-tests/cache/sprout`. This allows 
+      funds from the files in `qa/rpc-tests/cache/sprout`. This allows
       testing of Sprout spends even though Sprout outputs can no longer
       be created by zcashd software. The resulting nodes will be configured to
-      use the -clockoffset config argument when starting to ensure that 
+      use the -clockoffset config argument when starting to ensure that
       the cached chain is not treated as being excessively out-of-date.
     * 'fresh': force re-creation of the cache, and then start as for `current`.
     * 'clean': start the nodes without cached chain data, allowing the test
@@ -261,6 +283,7 @@ def initialize_chain(test_dir, num_nodes, cachedir, cache_behavior='current'):
             datadir = initialize_datadir(cachedir, i)
             args = [ zcashd_binary(), "-keypool=1", "-datadir="+datadir, "-discover=0" ]
             args.extend([
+                '-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025',
                 '-nuparams=5ba81b19:1', # Overwinter
                 '-nuparams=76b809bb:1', # Sapling
                 '-mocktime=%d' % block_time
@@ -325,7 +348,7 @@ def initialize_chain(test_dir, num_nodes, cachedir, cache_behavior='current'):
                 # obtain the clock offset as a negative number of seconds
                 offset = round(cache_conf['cache_time']) - round(time.time())
                 # overwrite port/rpcport and clock offset in zcash.conf
-                initialize_datadir(test_dir, i, clock_offset=offset) 
+                initialize_datadir(test_dir, i, clock_offset=offset)
 
     def init_persistent(cache_behavior):
         assert num_nodes <= 4 # only 4 nodes with Sprout funds are supported
@@ -343,14 +366,14 @@ def initialize_chain(test_dir, num_nodes, cachedir, cache_behavior='current'):
 
             # Copy the same chain data to all nodes
             with tarfile.open(chain_cache_filename, "r:gz") as chain_cache_file:
-                chain_cache_file.extractall(path = to_dir)
+                tarfile_extractall(chain_cache_file, to_dir)
 
             # Copy in per-node wallet data
             wallet_tgz_filename = os.path.join(cache_path, "node"+str(i)+"_wallet.tar.gz")
             if not os.path.exists(wallet_tgz_filename):
                 raise Exception('Wallet cache missing for cache behavior %s, node %d' % (cache_behavior, i))
             with tarfile.open(wallet_tgz_filename, "r:gz") as wallet_tgz_file:
-                wallet_tgz_file.extractall(path = os.path.join(to_dir, "wallet.dat"))
+                tarfile_extractall(wallet_tgz_file, os.path.join(to_dir, "wallet.dat"))
 
             # Copy in per-node wallet config and update zcash.conf to set the
             # clock offsets correctly.
@@ -362,7 +385,7 @@ def initialize_chain(test_dir, num_nodes, cachedir, cache_behavior='current'):
                 # obtain the clock offset as a negative number of seconds
                 offset = round(cache_conf['cache_time']) - round(time.time())
                 # overwrite port/rpcport and clock offset in zcash.conf
-                initialize_datadir(test_dir, i, clock_offset=offset) 
+                initialize_datadir(test_dir, i, clock_offset=offset)
 
     def cache_rebuild_required():
         for i in range(MAX_NODES):
@@ -375,7 +398,7 @@ def initialize_chain(test_dir, num_nodes, cachedir, cache_behavior='current'):
         return False
 
     if cache_behavior == 'current':
-        if cache_rebuild_required(): rebuild_cache() 
+        if cache_rebuild_required(): rebuild_cache()
         init_from_cache()
     elif cache_behavior == 'fresh':
         rebuild_cache()
@@ -395,8 +418,8 @@ def initialize_chain_clean(test_dir, num_nodes):
 
 def persistent_cache_path(cache_behavior):
     return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 
-        'cache', 
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+        'cache',
         cache_behavior
     )
 
@@ -459,7 +482,7 @@ def _rpchost_to_args(rpchost):
     if rpchost is None:
         return []
 
-    match = re.match('(\[[0-9a-fA-f:]+\]|[^:]+)(?::([0-9]+))?$', rpchost)
+    match = re.match(r'(\[[0-9a-fA-f:]+\]|[^:]+)(?::([0-9]+))?$', rpchost)
     if not match:
         raise ValueError('Invalid RPC host spec ' + rpchost)
 
@@ -483,6 +506,7 @@ def start_node(i, dirname, extra_args=None, rpchost=None, timewait=None, binary=
         binary = zcashd_binary()
     args = [ binary, "-datadir="+datadir, "-keypool=1", "-discover=0", "-rest" ]
     args.extend([
+        '-i-am-aware-zcashd-will-be-replaced-by-zebrad-and-zallet-in-2025',
         '-nuparams=5ba81b19:1', # Overwinter
         '-nuparams=76b809bb:1', # Sapling
     ])
@@ -493,7 +517,7 @@ def start_node(i, dirname, extra_args=None, rpchost=None, timewait=None, binary=
     url = rpc_url(i, rpchost)
     wait_for_bitcoind_start(bitcoind_processes[i], url, i)
     if os.getenv("PYTHON_DEBUG", ""):
-        print("start_node: RPC successfully started")
+        print("start_node: RPC successfully started for node {} with pid {}".format(i, bitcoind_processes[i].pid))
     proxy = get_rpc_proxy(url, i, timeout=timewait)
 
     if COVERAGE_DIR:
@@ -690,6 +714,7 @@ def wait_and_assert_operationid_status_result(node, myopid, in_status='success',
     print('waiting for async operation {}'.format(myopid))
     result = None
     for _ in range(1, timeout):
+        assert_bitcoinds_alive()
         results = node.z_getoperationresult([myopid])
         if len(results) > 0:
             result = results[0]
@@ -757,3 +782,9 @@ def nustr(branch_id):
 
 def nuparams(branch_id, height):
     return '-nuparams=%s:%d' % (nustr(branch_id), height)
+
+def tarfile_extractall(tarfile, path):
+    if sys.version_info >= (3, 11, 4):
+        tarfile.extractall(path=path, filter='data')
+    else:
+        tarfile.extractall(path=path)

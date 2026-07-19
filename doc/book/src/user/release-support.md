@@ -1,5 +1,10 @@
 # `zcashd` Release Support
 
+> **Note:** `zcashd` is [deprecated](end-of-life.md) and does not support NU6.3. Its
+> 6.20.0 **End-of-Support halt** — block height 3417100, reached 2026-07-18 — has now shut
+> down every `zcashd` 6.20.0 node, ahead of NU6.3 mainnet activation (estimated 2026-07-28).
+> See the [End of Life](end-of-life.md) page for the full timeline and migration guidance.
+
 ## Release cadence and support window
 
 `zcashd` releases happen approximately every six weeks, although this may change if a
@@ -42,12 +47,11 @@ time, and may shift due to changes in network solution power.
 <!-- RELEASE_SCRIPT_START_MARKER - If you make changes here, check make-release.py -->
 | `zcashd` version | Release date | Halt height | End of Support |
 | ---------------- | ------------ | ----------- | -------------- |
-| 5.5.0-rc1 | 2023-04-20 | 2188024 | 2023-08-10 |
-| 5.5.0-rc2 | 2023-04-25 | 2193300 | 2023-08-15 |
-| 5.5.0-rc3 | 2023-04-27 | 2195224 | 2023-08-17 |
-| 5.5.0 | 2023-04-27 | 2196024 | 2023-08-17 |
-| 5.5.1 | 2023-05-16 | 2217487 | 2023-09-05 |
-| 5.6.0-rc1 | 2023-06-08 | 2243024 | 2023-09-28 |
-| 5.6.0 | 2023-06-14 | 2250924 | 2023-10-04 |
-| 5.6.1 | 2023-06-21 | 2258800 | 2023-10-11 |
+| 6.12.0 | 2026-03-27 | 3417100 | 2026-07-17 |
+| 6.12.1 | 2026-04-17 | 3417100 | 2026-07-17 |
+| 6.12.2 | 2026-05-06 | 3417100 | 2026-07-15 |
+| 6.12.3 | 2026-05-07 | 3417100 | 2026-07-16 |
+| 6.12.4 | 2026-06-01 | 3417100 | 2026-07-20 |
+| 6.12.5 | 2026-06-02 | 3417100 | 2026-07-21 |
+| 6.20.0 | 2026-06-02 | 3417100 | 2026-07-21 |
 <!-- RELEASE_SCRIPT_END_MARKER -->

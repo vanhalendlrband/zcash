@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2020 The Zcash developers
+# Copyright (c) 2020-2024 The Zcash developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -17,11 +17,11 @@ from test_framework.util import (
     CANOPY_BRANCH_ID,
     NU5_BRANCH_ID,
 )
+from test_framework.zip317 import ZIP_317_FEE
 
 import logging
 
 HAS_CANOPY = [
-    '-minrelaytxfee=0',
     '-nurejectoldversions=false',
     '-anchorconfirmations=1',
     nuparams(BLOSSOM_BRANCH_ID, 205),
@@ -31,6 +31,7 @@ HAS_CANOPY = [
     '-allowdeprecated=getnewaddress',
     '-allowdeprecated=z_getnewaddress',
     '-allowdeprecated=z_getbalance',
+    '-regtestallowlegacychainsupplydata',
 ]
 
 class RemoveSproutShieldingTest (BitcoinTestFramework):
@@ -69,8 +70,8 @@ class RemoveSproutShieldingTest (BitcoinTestFramework):
         n0_taddr0 = self.nodes[0].getnewaddress()
         for _ in range(3):
             recipients = [{"address": n0_taddr0, "amount": Decimal('1')}]
-            myopid = self.nodes[0].z_sendmany(n0_sprout_addr0, recipients, 1, 0, 'AllowRevealedRecipients')
-            wait_and_assert_operationid_status(self.nodes[0], myopid)
+            myopid = self.nodes[0].z_sendmany(n0_sprout_addr0, recipients, 1, ZIP_317_FEE, 'AllowRevealedRecipients')
+            wait_and_assert_operationid_status(self.nodes[0], myopid, timeout=1200)
             self.sync_all()
             self.nodes[0].generate(1)
             self.sync_all()
@@ -82,15 +83,15 @@ class RemoveSproutShieldingTest (BitcoinTestFramework):
             JSONRPCException,
             "Sending funds into the Sprout pool is no longer supported.",
             self.nodes[0].z_mergetoaddress,
-            ["ANY_TADDR"], n1_sprout_addr0, 0)
+            ["ANY_TADDR"], n1_sprout_addr0, ZIP_317_FEE)
 
         self.nodes[0].generate(1)
         self.sync_all()
 
         # Send some funds back to n0_taddr0
         recipients = [{"address": n0_taddr0, "amount": Decimal('1')}]
-        myopid = self.nodes[0].z_sendmany(n0_sprout_addr0, recipients, 1, 0, 'AllowRevealedRecipients')
-        wait_and_assert_operationid_status(self.nodes[0], myopid)
+        myopid = self.nodes[0].z_sendmany(n0_sprout_addr0, recipients, 1, ZIP_317_FEE, 'AllowRevealedRecipients')
+        wait_and_assert_operationid_status(self.nodes[0], myopid, timeout=1200)
 
         # Mine to one block before Canopy activation on node 0; adding value
         # to the Sprout pool will fail now since the transaction must be
@@ -114,8 +115,8 @@ class RemoveSproutShieldingTest (BitcoinTestFramework):
         # Create taddr -> Sprout z_sendmany transaction on node 0. Should fail
         n1_sprout_addr1 = self.nodes[1].z_getnewaddress('sprout')
         recipients = [{"address": n1_sprout_addr1, "amount": Decimal('1')}]
-        myopid = self.nodes[0].z_sendmany(n0_taddr0, recipients, 1, 0)
-        wait_and_assert_operationid_status(self.nodes[0], myopid, "failed", unsupported_sprout_msg)
+        myopid = self.nodes[0].z_sendmany(n0_taddr0, recipients, 1, ZIP_317_FEE)
+        wait_and_assert_operationid_status(self.nodes[0], myopid, "failed", unsupported_sprout_msg, timeout=1200)
         print("taddr -> Sprout z_sendmany tx rejected at Canopy activation on node 0")
 
         # Create z_mergetoaddress [taddr, Sprout] -> Sprout transaction on node 0. Should fail
@@ -139,8 +140,8 @@ class RemoveSproutShieldingTest (BitcoinTestFramework):
 
         # Shield coinbase to Sapling on node 0. Should pass
         sapling_addr = self.nodes[0].z_getnewaddress('sapling')
-        myopid = self.nodes[0].z_shieldcoinbase(get_coinbase_address(self.nodes[0]), sapling_addr, 0)['opid']
-        wait_and_assert_operationid_status(self.nodes[0], myopid)
+        myopid = self.nodes[0].z_shieldcoinbase(get_coinbase_address(self.nodes[0]), sapling_addr, ZIP_317_FEE)['opid']
+        wait_and_assert_operationid_status(self.nodes[0], myopid, timeout=1200)
         print("taddr -> Sapling z_shieldcoinbase tx accepted after Canopy on node 0")
 
 if __name__ == '__main__':

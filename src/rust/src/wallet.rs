@@ -8,14 +8,14 @@ use std::io;
 use std::ptr;
 use std::slice;
 use tracing::error;
+use zcash_protocol::value::ZatBalance;
 
 use zcash_encoding::{Optional, Vector};
 use zcash_primitives::{
-    consensus::BlockHeight,
     merkle_tree::{read_position, write_position},
-    sapling::NOTE_COMMITMENT_TREE_DEPTH,
-    transaction::{components::Amount, TxId},
+    transaction::TxId,
 };
+use zcash_protocol::consensus::BlockHeight;
 
 use orchard::{
     bundle::Authorized,
@@ -150,7 +150,8 @@ pub struct Wallet {
     nullifiers: BTreeMap<Nullifier, OutPoint>,
     /// The incremental Merkle tree used to track note commitments and witnesses for notes
     /// belonging to the wallet.
-    commitment_tree: BridgeTree<MerkleHashOrchard, u32, NOTE_COMMITMENT_TREE_DEPTH>,
+    // TODO: Replace this with an `orchard` crate constant (they happen to be the same).
+    commitment_tree: BridgeTree<MerkleHashOrchard, u32, { sapling::NOTE_COMMITMENT_TREE_DEPTH }>,
     /// The block height at which the last checkpoint was created, if any.
     last_checkpoint: Option<BlockHeight>,
     /// The block height and transaction index of the note most recently added to
@@ -167,12 +168,14 @@ pub struct Wallet {
     potential_spends: BTreeMap<Nullifier, BTreeSet<InPoint>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum WalletError {
     OutOfOrder(LastObserved, BlockHeight, usize),
     NoteCommitmentTreeFull,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RewindError {
     /// The note commitment tree does not contain enough checkpoints to
@@ -182,6 +185,7 @@ pub enum RewindError {
     InsufficientCheckpoints(usize),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum BundleLoadError {
     /// The action at the specified index failed to decrypt with
@@ -196,6 +200,7 @@ pub enum BundleLoadError {
     InvalidActionIndex(usize),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SpendRetrievalError {
     DecryptedNoteNotFound(OutPoint),
@@ -374,14 +379,14 @@ impl Wallet {
     }
 
     /// Add note data for those notes that are decryptable with one of this wallet's
-    /// incoming viewing keys to the wallet, and return a a data structure that describes
+    /// incoming viewing keys to the wallet, and return a data structure that describes
     /// the actions that are involved with this wallet, either spending notes belonging
     /// to this wallet or creating new notes owned by this wallet.
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn add_notes_from_bundle(
         &mut self,
         txid: &TxId,
-        bundle: &Bundle<Authorized, Amount>,
+        bundle: &Bundle<Authorized, ZatBalance>,
     ) -> BundleWalletInvolvement {
         let mut involvement = BundleWalletInvolvement::new();
         // If we recognize any of our notes as being consumed as inputs to actions
@@ -419,7 +424,7 @@ impl Wallet {
     pub fn load_bundle(
         &mut self,
         txid: &TxId,
-        bundle: &Bundle<Authorized, Amount>,
+        bundle: &Bundle<Authorized, ZatBalance>,
         hints: BTreeMap<usize, &IncomingViewingKey>,
         potential_spend_idxs: &[u32],
     ) -> Result<(), BundleLoadError> {
@@ -505,7 +510,7 @@ impl Wallet {
     pub fn add_potential_spends(
         &mut self,
         txid: &TxId,
-        bundle: &Bundle<Authorized, Amount>,
+        bundle: &Bundle<Authorized, ZatBalance>,
     ) -> Vec<usize> {
         // Check for spends of our notes by matching against the nullifiers
         // we're tracking, and when we detect one, associate the current
@@ -537,7 +542,7 @@ impl Wallet {
         );
         self.potential_spends
             .entry(*nf)
-            .or_insert_with(BTreeSet::new)
+            .or_default()
             .insert(inpoint);
     }
 
@@ -556,14 +561,14 @@ impl Wallet {
         block_height: BlockHeight,
         block_tx_idx: usize,
         txid: &TxId,
-        bundle: &Bundle<Authorized, Amount>,
+        bundle: &Bundle<Authorized, ZatBalance>,
     ) -> Result<(), WalletError> {
         // Check that the wallet is in the correct state to update the note commitment tree with
         // new outputs.
         if let Some(last) = &self.last_observed {
             if !(
                 // we are observing a subsequent transaction in the same block
-                (block_height == last.block_height && last.block_tx_idx.map_or(false, |idx| idx < block_tx_idx))
+                (block_height == last.block_height && last.block_tx_idx.is_some_and(|idx| idx < block_tx_idx))
                 // or we are observing a new block
                 || block_height > last.block_height
             ) {
@@ -671,7 +676,7 @@ impl Wallet {
                         self.key_store
                             .ivk_for_address(&dnote.note.recipient())
                             // if `ivk` is `None`, return all notes that match the other conditions
-                            .filter(|dnote_ivk| ivk.map_or(true, |ivk| &ivk == dnote_ivk))
+                            .filter(|dnote_ivk| ivk.is_none_or(|ivk| &ivk == dnote_ivk))
                             .and_then(|dnote_ivk| {
                                 if (ignore_mined && self.mined_notes.contains_key(&outpoint))
                                     || (require_spending_key
@@ -854,7 +859,7 @@ pub type SpendIndexPushCb = unsafe extern "C" fn(obj: Option<FFICallbackReceiver
 pub extern "C" fn orchard_wallet_add_notes_from_bundle(
     wallet: *mut Wallet,
     txid: *const [c_uchar; 32],
-    bundle: *const Bundle<Authorized, Amount>,
+    bundle: *const Bundle<Authorized, ZatBalance>,
     cb_receiver: Option<FFICallbackReceiver>,
     action_ivk_push_cb: Option<ActionIvkPushCb>,
     spend_idx_push_cb: Option<SpendIndexPushCb>,
@@ -885,7 +890,7 @@ pub extern "C" fn orchard_wallet_add_notes_from_bundle(
 pub extern "C" fn orchard_wallet_load_bundle(
     wallet: *mut Wallet,
     txid: *const [c_uchar; 32],
-    bundle: *const Bundle<Authorized, Amount>,
+    bundle: *const Bundle<Authorized, ZatBalance>,
     hints: *const FFIActionIvk,
     hints_len: usize,
     potential_spend_idxs: *const u32,
@@ -922,7 +927,7 @@ pub extern "C" fn orchard_wallet_append_bundle_commitments(
     block_height: u32,
     block_tx_idx: usize,
     txid: *const [c_uchar; 32],
-    bundle: *const Bundle<Authorized, Amount>,
+    bundle: *const Bundle<Authorized, ZatBalance>,
 ) -> bool {
     let wallet = unsafe { wallet.as_mut() }.expect("Wallet pointer may not be null");
     let txid = TxId::from_bytes(*unsafe { txid.as_ref() }.expect("txid may not be null."));
@@ -1107,7 +1112,7 @@ pub type OutputPushCB =
 #[no_mangle]
 pub extern "C" fn orchard_wallet_get_txdata(
     wallet: *const Wallet,
-    bundle: *const Bundle<Authorized, Amount>,
+    bundle: *const Bundle<Authorized, ZatBalance>,
     raw_ovks: *const [u8; 32],
     raw_ovks_len: usize,
     callback_receiver: Option<FFICallbackReceiver>,
@@ -1177,6 +1182,18 @@ pub extern "C" fn orchard_wallet_get_txdata(
     } else {
         false
     }
+}
+
+#[no_mangle]
+pub extern "C" fn orchard_wallet_is_nullifier_from_me(
+    wallet: *const Wallet,
+    nullifier: *const [c_uchar; 32],
+) -> bool {
+    let wallet = unsafe { wallet.as_ref() }.expect("Wallet pointer may not be null.");
+    let nullifier =
+        Nullifier::from_bytes(unsafe { nullifier.as_ref() }.expect("nullifier may not be null."));
+
+    wallet.nullifiers.contains_key(&nullifier.unwrap())
 }
 
 pub type PushTxId = unsafe extern "C" fn(obj: Option<FFICallbackReceiver>, txid: *const [u8; 32]);
@@ -1255,6 +1272,7 @@ pub extern "C" fn orchard_wallet_gc_note_commitment_tree(wallet: *mut Wallet) {
 
 const NOTE_STATE_V1: u8 = 1;
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 #[no_mangle]
 pub extern "C" fn orchard_wallet_write_note_commitment_tree(
     wallet: *const Wallet,
@@ -1303,6 +1321,7 @@ pub extern "C" fn orchard_wallet_write_note_commitment_tree(
     }
 }
 
+#[allow(clippy::needless_borrows_for_generic_args)]
 #[no_mangle]
 pub extern "C" fn orchard_wallet_load_note_commitment_tree(
     wallet: *mut Wallet,
@@ -1370,7 +1389,10 @@ pub extern "C" fn orchard_wallet_load_note_commitment_tree(
 #[no_mangle]
 pub extern "C" fn orchard_wallet_init_from_frontier(
     wallet: *mut Wallet,
-    frontier: *const bridgetree::Frontier<MerkleHashOrchard, NOTE_COMMITMENT_TREE_DEPTH>,
+    frontier: *const bridgetree::Frontier<
+        MerkleHashOrchard,
+        { sapling::NOTE_COMMITMENT_TREE_DEPTH },
+    >,
 ) -> bool {
     let wallet = unsafe { wallet.as_mut() }.expect("Wallet pointer may not be null.");
     let frontier = unsafe { frontier.as_ref() }.expect("Wallet pointer may not be null.");

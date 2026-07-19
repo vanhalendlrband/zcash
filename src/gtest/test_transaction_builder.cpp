@@ -40,7 +40,7 @@ TEST(TransactionBuilder, TransparentToSapling)
 
     // Create a shielding transaction from transparent to Sapling
     // 0.00005 t-ZEC in, 0.00004 z-ZEC out, default fee
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, SaplingMerkleTree::empty_root(), &keystore);
     builder.AddTransparentInput(COutPoint(uint256S("1234"), 0), scriptPubKey, 5000);
     builder.AddSaplingOutput(fvk_from.ovk, pk, 4000, {});
     auto tx = builder.Build().GetTxOrThrow();
@@ -49,7 +49,7 @@ TEST(TransactionBuilder, TransparentToSapling)
     EXPECT_EQ(tx.vout.size(), 0);
     EXPECT_EQ(tx.vJoinSplit.size(), 0);
     EXPECT_EQ(tx.GetSaplingSpendsCount(), 0);
-    EXPECT_EQ(tx.GetSaplingOutputsCount(), 1);
+    EXPECT_EQ(tx.GetSaplingOutputsCount(), 2);
     EXPECT_EQ(tx.GetValueBalanceSapling(), -4000);
 
     CValidationState state;
@@ -74,7 +74,7 @@ TEST(TransactionBuilder, SaplingToSapling) {
 
     // Create a Sapling-only transaction
     // 0.00004 z-ZEC in, 0.000025 z-ZEC out, default fee, 0.000005 z-ZEC change
-    auto builder = TransactionBuilder(Params(), 2, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 2, std::nullopt, testNote.tree.root());
     builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
 
     // Check that trying to add a different anchor fails
@@ -119,7 +119,7 @@ TEST(TransactionBuilder, SaplingToSprout) {
     // - 0.00004 Sapling-ZEC in     - 0.000025 Sprout-ZEC out
     //                              - 0.000005 Sapling-ZEC change
     //                              - default t-ZEC fee
-    auto builder = TransactionBuilder(Params(), 2, std::nullopt, nullptr);
+    auto builder = TransactionBuilder(Params(), 2, std::nullopt, testNote.tree.root(), nullptr);
     builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
     builder.AddSproutOutput(sproutAddr, 2500, std::nullopt);
     auto tx = builder.Build().GetTxOrThrow();
@@ -173,7 +173,7 @@ TEST(TransactionBuilder, SproutToSproutAndSapling) {
     //                              - 0.00005 Sprout-ZEC change
     //                              - 0.00005 Sapling-ZEC out
     //                              - 0.00005 t-ZEC fee
-    auto builder = TransactionBuilder(Params(), 2, std::nullopt, nullptr, &view);
+    auto builder = TransactionBuilder(Params(), 2, std::nullopt, SaplingMerkleTree::empty_root(), nullptr, &view);
     builder.SetFee(5000);
     builder.AddSproutInput(sproutSk, sproutNote, sproutWitness);
     builder.AddSproutOutput(sproutAddr, 6000, std::nullopt);
@@ -193,7 +193,7 @@ TEST(TransactionBuilder, SproutToSproutAndSapling) {
     EXPECT_EQ(tx.vJoinSplit[2].vpub_old, 0);
     EXPECT_EQ(tx.vJoinSplit[2].vpub_new, 10000);
     EXPECT_EQ(tx.GetSaplingSpendsCount(), 0);
-    EXPECT_EQ(tx.GetSaplingOutputsCount(), 1);
+    EXPECT_EQ(tx.GetSaplingOutputsCount(), 2);
     EXPECT_EQ(tx.GetValueBalanceSapling(), -5000);
 
     CValidationState state;
@@ -247,7 +247,7 @@ TEST(TransactionBuilder, TransparentToOrchard)
 
     // Create a shielding transaction from transparent to Orchard
     // 0.00005 t-ZEC in, 0.00004 z-ZEC out, default fee
-    auto builder = TransactionBuilder(Params(), 1, orchardAnchor, &keystore);
+    auto builder = TransactionBuilder(Params(), 1, orchardAnchor, SaplingMerkleTree::empty_root(), &keystore);
     builder.AddTransparentInput(COutPoint(uint256S("1234"), 0), scriptPubKey, 5000);
     builder.AddOrchardOutput(std::nullopt, recipient, 4000, std::nullopt);
     auto maybeTx = builder.Build();
@@ -274,12 +274,101 @@ TEST(TransactionBuilder, TransparentToOrchard)
     RegtestDeactivateNU5();
 }
 
+TEST(TransactionBuilder, RejectsTransparentToOrchardIfDisabled)
+{
+    LoadProofParameters();
+
+    int orchardDisabledHeight = 5;
+    auto consensusParams = RegtestActivateNU6point1(
+        false, Consensus::NetworkUpgrade::ALWAYS_ACTIVE, orchardDisabledHeight);
+
+    CBasicKeyStore keystore;
+    CKey tsk = AddTestCKeyToKeyStore(keystore);
+    auto scriptPubKey = GetScriptForDestination(tsk.GetPubKey().GetID());
+
+    auto coinType = Params().BIP44CoinType();
+    auto seed = MnemonicSeed::Random(coinType);
+    auto sk = libzcash::OrchardSpendingKey::ForAccount(seed, coinType, 0);
+    auto fvk = sk.ToFullViewingKey();
+    auto ivk = fvk.ToIncomingViewingKey();
+    libzcash::diversifier_index_t j(0);
+    auto recipient = ivk.Address(j);
+
+    auto orchardAnchor = uint256();
+
+    // Create a shielding transaction from transparent to Orchard
+    // 0.00005 t-ZEC in, 0.00004 z-ZEC out, default fee
+    auto builder = TransactionBuilder(Params(), 1, orchardAnchor, SaplingMerkleTree::empty_root(), &keystore);
+    builder.AddTransparentInput(COutPoint(uint256S("1234"), 0), scriptPubKey, 5000);
+    builder.AddOrchardOutput(std::nullopt, recipient, 4000, std::nullopt);
+    auto maybeTx = builder.Build();
+    EXPECT_TRUE(maybeTx.IsTx());
+    if (maybeTx.IsError()) {
+        std::cerr << "Failed to build transaction: " << maybeTx.GetError() << std::endl;
+        GTEST_FAIL();
+    }
+    auto tx = maybeTx.GetTxOrThrow();
+
+    EXPECT_EQ(tx.vin.size(), 1);
+    EXPECT_EQ(tx.vout.size(), 0);
+    EXPECT_EQ(tx.vJoinSplit.size(), 0);
+    EXPECT_EQ(tx.GetSaplingSpendsCount(), 0);
+    EXPECT_EQ(tx.GetSaplingOutputsCount(), 0);
+    EXPECT_TRUE(tx.GetOrchardBundle().IsPresent());
+    EXPECT_EQ(tx.GetOrchardBundle().GetValueBalance(), -4000);
+
+    // The soft fork activates at exactly orchardDisabledHeight (nHeight >= height); one
+    // block earlier the same transaction is still accepted.
+    {
+        CValidationState state;
+        EXPECT_TRUE(ContextualCheckTransaction(tx, state, Params(), orchardDisabledHeight - 1, true));
+    }
+    // Rejected at the activation height, in both block (isMined = true) and mempool
+    // (isMined = false) validation.
+    for (bool isMined : {true, false}) {
+        CValidationState state;
+        EXPECT_FALSE(ContextualCheckTransaction(tx, state, Params(), orchardDisabledHeight, isMined));
+        EXPECT_EQ(state.GetRejectReason(), "bad-tx-has-orchard-actions");
+    }
+
+    // Revert to default
+    RegtestDeactivateNU6point1();
+}
+
+// Negative control: a transaction with no Orchard actions is unaffected by the soft fork.
+TEST(TransactionBuilder, AcceptsNonOrchardWhenOrchardDisabled)
+{
+    int orchardDisabledHeight = 1;
+    auto consensusParams = RegtestActivateNU6point1(
+        false, Consensus::NetworkUpgrade::ALWAYS_ACTIVE, orchardDisabledHeight);
+
+    CBasicKeyStore keystore;
+    CKey tsk = AddTestCKeyToKeyStore(keystore);
+    auto scriptPubKey = GetScriptForDestination(tsk.GetPubKey().GetID());
+    CTxDestination taddr = tsk.GetPubKey().GetID();
+
+    // Transparent-to-transparent: 0.00005 t-ZEC in, 0.00004 t-ZEC out, default fee.
+    auto builder = TransactionBuilder(Params(), orchardDisabledHeight, std::nullopt, SaplingMerkleTree::empty_root(), &keystore);
+    builder.AddTransparentInput(COutPoint(uint256S("1234"), 0), scriptPubKey, 5000);
+    builder.AddTransparentOutput(taddr, 4000);
+    auto maybeTx = builder.Build();
+    ASSERT_TRUE(maybeTx.IsTx());
+    auto tx = maybeTx.GetTxOrThrow();
+    ASSERT_FALSE(tx.GetOrchardBundle().IsPresent());
+
+    CValidationState state;
+    EXPECT_TRUE(ContextualCheckTransaction(tx, state, Params(), 2, true));
+
+    // Revert to default
+    RegtestDeactivateNU6point1();
+}
+
 TEST(TransactionBuilder, ThrowsOnTransparentInputWithoutKeyStore)
 {
     SelectParams(CBaseChainParams::REGTEST);
     const Consensus::Params& consensusParams = Params().GetConsensus();
 
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, SaplingMerkleTree::empty_root());
     ASSERT_THROW(builder.AddTransparentInput(COutPoint(), CScript(), 1), std::runtime_error);
 }
 
@@ -290,7 +379,7 @@ TEST(TransactionBuilder, RejectsInvalidTransparentOutput)
 
     // Default CTxDestination type is an invalid address
     CTxDestination taddr;
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, SaplingMerkleTree::empty_root());
     ASSERT_THROW(builder.AddTransparentOutput(taddr, 50), UniValue);
 }
 
@@ -317,13 +406,13 @@ TEST(TransactionBuilder, FailsWithNegativeChange)
 
     // Fail if there is only a Sapling output
     // 0.00005 z-ZEC out, default fee
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
     builder.AddSaplingOutput(fvk.ovk, pa, 5000, {});
     EXPECT_EQ("Change cannot be negative: -0.00006 ZEC", builder.Build().GetError());
 
     // Fail if there is only a transparent output
     // 0.00005 t-ZEC out, default fee
-    builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+    builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root(), &keystore);
     builder.AddTransparentOutput(taddr, 5000);
     EXPECT_EQ("Change cannot be negative: -0.00006 ZEC", builder.Build().GetError());
 
@@ -368,17 +457,18 @@ TEST(TransactionBuilder, ChangeOutput)
     auto scriptPubKey = GetScriptForDestination(tkeyid);
 
     auto fakeCoin = COutPoint(uint256S("7777777777777777777777777777777777777777777777777777777777777777"), 0);
+    auto saplingAnchor = SaplingMerkleTree::empty_root();
 
     // No change address and no Sapling spends
     {
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, saplingAnchor, &keystore);
         builder.AddTransparentInput(fakeCoin, scriptPubKey, 2500);
         EXPECT_EQ("Could not determine change address", builder.Build().GetError());
     }
 
     // Change to the same address as the first Sapling spend
     {
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root(), &keystore);
         builder.AddTransparentInput(fakeCoin, scriptPubKey, 2500);
         builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
         auto tx = builder.Build().GetTxOrThrow();
@@ -393,7 +483,7 @@ TEST(TransactionBuilder, ChangeOutput)
 
     // Change to a Sapling address
     {
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, saplingAnchor, &keystore);
         builder.AddTransparentInput(fakeCoin, scriptPubKey, 2500);
         builder.SendChangeTo(zChangeAddr, fvkOut.ovk);
         auto tx = builder.Build().GetTxOrThrow();
@@ -402,13 +492,13 @@ TEST(TransactionBuilder, ChangeOutput)
         EXPECT_EQ(tx.vout.size(), 0);
         EXPECT_EQ(tx.vJoinSplit.size(), 0);
         EXPECT_EQ(tx.GetSaplingSpendsCount(), 0);
-        EXPECT_EQ(tx.GetSaplingOutputsCount(), 1);
+        EXPECT_EQ(tx.GetSaplingOutputsCount(), 2);
         EXPECT_EQ(tx.GetValueBalanceSapling(), -1500);
     }
 
     // Change to a transparent address
     {
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, saplingAnchor, &keystore);
         builder.AddTransparentInput(fakeCoin, scriptPubKey, 2500);
         builder.SendChangeTo(tkeyid, {});
         auto tx = builder.Build().GetTxOrThrow();
@@ -442,7 +532,7 @@ TEST(TransactionBuilder, SetFee)
 
     // Default fee
     {
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
         builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
         builder.AddSaplingOutput(fvk.ovk, pa, 25000, {});
         auto tx = builder.Build().GetTxOrThrow();
@@ -458,7 +548,7 @@ TEST(TransactionBuilder, SetFee)
 
     // Configured fee
     {
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
         builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
         builder.AddSaplingOutput(fvk.ovk, pa, 25000, {});
         builder.SetFee(20000);
@@ -487,7 +577,8 @@ TEST(TransactionBuilder, CheckSaplingTxVersion)
     auto pk = sk.ToXFVK().DefaultAddress();
 
     // Cannot add Sapling outputs to a non-Sapling transaction
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    SaplingMerkleTree tree;
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, tree.root());
     try {
         builder.AddSaplingOutput(uint256(), pk, 12345, {});
     } catch (std::runtime_error const & err) {
@@ -498,7 +589,6 @@ TEST(TransactionBuilder, CheckSaplingTxVersion)
 
     // Cannot add Sapling spends to a non-Sapling transaction
     libzcash::SaplingNote note(pk, 50000, libzcash::Zip212Enabled::BeforeZip212);
-    SaplingMerkleTree tree;
     try {
         builder.AddSaplingSpend(sk, note, tree.witness());
     } catch (std::runtime_error const & err) {

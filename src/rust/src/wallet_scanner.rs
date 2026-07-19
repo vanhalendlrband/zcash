@@ -10,16 +10,14 @@ use std::sync::{
 
 use crossbeam_channel as channel;
 use memuse::DynamicUsage;
+use sapling::bundle::OutputDescription;
+use sapling::{bundle::GrothProofBytes, note_encryption::SaplingDomain};
 use zcash_note_encryption::{batch, BatchDomain, Domain, ShieldedOutput, ENC_CIPHERTEXT_SIZE};
 use zcash_primitives::{
     block::BlockHash,
-    consensus,
-    sapling::note_encryption::SaplingDomain,
-    transaction::{
-        components::{sapling::GrothProofBytes, OutputDescription},
-        Transaction, TxId,
-    },
+    transaction::{components::sapling as sapling_serialization, Transaction, TxId},
 };
+use zcash_protocol::consensus;
 
 use crate::{bridge::ffi, note_encryption::parse_and_prepare_sapling_ivk, params::Network};
 
@@ -38,7 +36,7 @@ trait OutputDomain: BatchDomain {
     const KIND: &'static str;
 }
 
-impl<P: consensus::Parameters> OutputDomain for SaplingDomain<P> {
+impl OutputDomain for SaplingDomain {
     const KIND: &'static str = "sapling";
 }
 
@@ -306,7 +304,7 @@ where
         );
 
         for (decryption_result, OutputReplier(replier)) in
-            decryption_results.into_iter().zip(repliers.into_iter())
+            decryption_results.into_iter().zip(repliers)
         {
             // If `decryption_result` is `None` then we will just drop `replier`,
             // indicating to the parent `BatchRunner` that this output was not for us.
@@ -381,7 +379,7 @@ impl<A, D: Domain> DynamicUsage for BatchReceiver<A, D> {
         // linked list. `crossbeam_channel` allocates memory for the linked list in blocks
         // of 31 items.
         const ITEMS_PER_BLOCK: usize = 31;
-        let num_blocks = (num_items + ITEMS_PER_BLOCK - 1) / ITEMS_PER_BLOCK;
+        let num_blocks = num_items.div_ceil(ITEMS_PER_BLOCK);
 
         // The structure of a block is:
         // - A pointer to the next block.
@@ -550,7 +548,7 @@ where
 }
 
 type SaplingRunner =
-    BatchRunner<[u8; 32], SaplingDomain<Network>, OutputDescription<GrothProofBytes>, WithUsage>;
+    BatchRunner<[u8; 32], SaplingDomain, OutputDescription<GrothProofBytes>, WithUsage>;
 
 /// A batch scanner for the `zcashd` wallet.
 pub(crate) struct BatchScanner {
@@ -622,7 +620,7 @@ impl BatchScanner {
             runner.add_outputs(
                 block_tag,
                 txid,
-                || SaplingDomain::for_height(params, height),
+                || SaplingDomain::new(sapling_serialization::zip212_enforcement(&params, height)),
                 bundle.shielded_outputs(),
             );
         }
@@ -671,7 +669,7 @@ impl BatchScanner {
 }
 
 pub(crate) struct BatchResult {
-    sapling: HashMap<(TxId, usize), DecryptedNote<[u8; 32], SaplingDomain<Network>>>,
+    sapling: HashMap<(TxId, usize), DecryptedNote<[u8; 32], SaplingDomain>>,
 }
 
 impl BatchResult {

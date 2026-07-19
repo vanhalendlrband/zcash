@@ -1,22 +1,17 @@
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::Cursor;
 use std::{ptr, slice};
 
 use blake2b_simd::Hash;
 use libc::{c_uchar, size_t};
 use tracing::error;
+use transparent::{address::Script, sighash::TransparentAuthorizingContext};
 use zcash_encoding::Vector;
-use zcash_primitives::{
-    consensus::BranchId,
-    legacy::Script,
-    transaction::{
-        components::{sapling, transparent, Amount},
-        sighash::{SignableInput, TransparentAuthorizingContext},
-        sighash_v5::v5_signature_hash,
-        txid::TxIdDigester,
-        Authorization, Transaction, TransactionData, TxDigests, TxVersion,
-    },
+use zcash_primitives::transaction::{
+    sighash::SignableInput, sighash_v5::v5_signature_hash, txid::TxIdDigester, Authorization,
+    Transaction, TransactionData, TxDigests, TxVersion,
 };
+use zcash_protocol::{consensus::BranchId, value::Zatoshis};
 
 /// Calculates identifying and authorizing digests for the given transaction.
 ///
@@ -33,7 +28,22 @@ pub extern "C" fn zcash_transaction_digests(
 ) -> bool {
     let tx_bytes = unsafe { slice::from_raw_parts(tx_bytes, tx_bytes_len) };
 
-    // We use a placeholder branch ID here, since it is not used for anything.
+    // The branch ID argument here is a placeholder. It is only used for v1-v4 transactions,
+    // which do not encode a consensus branch id; v5+ transactions carry their own
+    // `nConsensusBranchId`, which `Transaction::read` reads and uses in preference to this
+    // argument. This matters for the consensus rule below: Orchard bundles only exist in v5+
+    // transactions, so the proof-size enforcement always keys off the transaction's real
+    // branch id, never this placeholder.
+    //
+    // CONSENSUS: this parse is consensus-critical, not merely a hashing convenience. It is
+    // reached from CTransaction::UpdateHash on every transaction deserialization, so any
+    // input that `Transaction::read` rejects is rejected by consensus: in Zcash a structural
+    // or encoding violation IS a consensus-rule violation, with no leniency for malformed
+    // data. Rules enforced at this parse include canonical element encodings (e.g. a valid,
+    // non-identity Orchard `ephemeralKey`) and, against the transaction's own (v5+) consensus
+    // branch id, the canonical Orchard proof size (Strict for NU6.2 onward; see
+    // `read_v5_bundle` in zcash_primitives). Do not relax this parse on the assumption that a
+    // rejected encoding is "only" a parse error — doing so can silently drop a consensus rule.
     let tx = match Transaction::read(tx_bytes, BranchId::Canopy) {
         Ok(tx) => tx,
         Err(e) => {
@@ -49,9 +59,7 @@ pub extern "C" fn zcash_transaction_digests(
         match tx.version() {
             // Pre-NU5 transaction formats don't have authorizing data commitments; when
             // included in the authDataCommitment tree, they use the [0xff; 32] value.
-            TxVersion::Sprout(_) | TxVersion::Overwinter | TxVersion::Sapling => {
-                *auth_digest_ret = [0xff; 32]
-            }
+            TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => *auth_digest_ret = [0xff; 32],
             _ => auth_digest_ret.copy_from_slice(tx.auth_commitment().as_bytes()),
         }
     }
@@ -61,25 +69,25 @@ pub extern "C" fn zcash_transaction_digests(
 
 #[derive(Clone, Debug)]
 pub(crate) struct TransparentAuth {
-    all_prev_outputs: Vec<transparent::TxOut>,
+    all_prev_outputs: Vec<transparent::bundle::TxOut>,
 }
 
-impl transparent::Authorization for TransparentAuth {
+impl transparent::bundle::Authorization for TransparentAuth {
     type ScriptSig = Script;
 }
 
 impl TransparentAuthorizingContext for TransparentAuth {
-    fn input_amounts(&self) -> Vec<Amount> {
+    fn input_amounts(&self) -> Vec<Zatoshis> {
         self.all_prev_outputs
             .iter()
-            .map(|prevout| prevout.value)
+            .map(|prevout| prevout.value())
             .collect()
     }
 
     fn input_scriptpubkeys(&self) -> Vec<Script> {
         self.all_prev_outputs
             .iter()
-            .map(|prevout| prevout.script_pubkey.clone())
+            .map(|prevout| prevout.script_pubkey().clone())
             .collect()
     }
 }
@@ -91,13 +99,13 @@ pub(crate) struct MapTransparent {
 impl MapTransparent {
     pub(crate) fn parse(all_prev_outputs: &[u8], tx: &Transaction) -> Result<Self, String> {
         let mut cursor = Cursor::new(all_prev_outputs);
-        match Vector::read(&mut cursor, transparent::TxOut::read) {
+        match Vector::read(&mut cursor, transparent::bundle::TxOut::read) {
             Err(e) => Err(format!("Invalid all_prev_outputs field: {}", e)),
             Ok(_) if (cursor.position() as usize) != all_prev_outputs.len() => {
                 Err("all_prev_outputs had trailing data".into())
             }
             Ok(all_prev_outputs)
-                if tx.transparent_bundle().map_or(false, |t| {
+                if tx.transparent_bundle().is_some_and(|t| {
                     // Coinbase txs have one fake input.
                     t.is_coinbase() && !all_prev_outputs.is_empty()
                 }) =>
@@ -130,15 +138,17 @@ impl MapTransparent {
     }
 }
 
-impl transparent::MapAuth<transparent::Authorized, TransparentAuth> for MapTransparent {
+impl transparent::bundle::MapAuth<transparent::bundle::Authorized, TransparentAuth>
+    for MapTransparent
+{
     fn map_script_sig(
         &self,
-        s: <transparent::Authorized as transparent::Authorization>::ScriptSig,
-    ) -> <TransparentAuth as transparent::Authorization>::ScriptSig {
+        s: <transparent::bundle::Authorized as transparent::bundle::Authorization>::ScriptSig,
+    ) -> <TransparentAuth as transparent::bundle::Authorization>::ScriptSig {
         s
     }
 
-    fn map_authorization(&self, _: transparent::Authorized) -> TransparentAuth {
+    fn map_authorization(&self, _: transparent::bundle::Authorized) -> TransparentAuth {
         // TODO: This map should consume self, so we can move self.auth
         self.auth.clone()
     }
@@ -148,7 +158,7 @@ pub(crate) struct PrecomputedAuth;
 
 impl Authorization for PrecomputedAuth {
     type TransparentAuth = TransparentAuth;
-    type SaplingAuth = sapling::Authorized;
+    type SaplingAuth = sapling::bundle::Authorized;
     type OrchardAuth = orchard::bundle::Authorized;
 }
 
@@ -192,7 +202,7 @@ pub extern "C" fn zcash_transaction_precomputed_init(
     };
 
     match tx.version() {
-        TxVersion::Sprout(_) | TxVersion::Overwinter | TxVersion::Sapling => {
+        TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => {
             // We don't support these legacy transaction formats in this API.
             ptr::null_mut()
         }
@@ -251,7 +261,7 @@ pub extern "C" fn zcash_transaction_zip244_signature_digest(
     };
     if matches!(
         precomputed_tx.tx.version(),
-        TxVersion::Sprout(_) | TxVersion::Overwinter | TxVersion::Sapling,
+        TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4,
     ) {
         error!("Cannot calculate ZIP 244 digest for pre-v5 transaction");
         return false;
@@ -260,9 +270,43 @@ pub extern "C" fn zcash_transaction_zip244_signature_digest(
     let signable_input = if index == NOT_AN_INPUT {
         SignableInput::Shielded
     } else {
-        let prevout = match precomputed_tx.tx.transparent_bundle() {
+        // This conversion to `u8` is always fine:
+        // - We only call this FFI method once we already know we are using ZIP 244.
+        // - Even if we weren't, `hash_type` is one byte tacked onto the end of a
+        //   signature, so it always fits into a `u8` (and TBH I don't know why we
+        //   ever set it to `u32`).
+        let hash_type = u8::try_from(hash_type).unwrap();
+
+        let hash_type = match transparent::sighash::SighashType::parse(hash_type) {
+            Some(hash_type) => hash_type,
+            None => {
+                error!("hash_type violates the ZIP 244 rules");
+                return false;
+            }
+        };
+
+        match precomputed_tx.tx.transparent_bundle() {
             Some(bundle) => match bundle.authorization.all_prev_outputs.get(index) {
-                Some(prevout) => prevout,
+                Some(prevout) => {
+                    match transparent::sighash::SignableInput::from_parts(
+                        bundle,
+                        hash_type,
+                        index,
+                        // `script_code` is unused by `v5_signature_hash`, so instead of passing the
+                        // real `script_code` across the FFI (and paying the serialization and parsing
+                        // cost for no benefit), we set it to the prevout's `script_pubkey`. This
+                        // happens to be correct anyway for every output script kind except P2SH.
+                        prevout.script_pubkey(),
+                        prevout.script_pubkey(),
+                        prevout.value(),
+                    ) {
+                        Ok(input) => SignableInput::Transparent(input),
+                        Err(_) => {
+                            error!("transparent input does not validate against bundle");
+                            return false;
+                        }
+                    }
+                }
                 None => {
                     error!("nIn out of range");
                     return false;
@@ -272,23 +316,6 @@ pub extern "C" fn zcash_transaction_zip244_signature_digest(
                 error!("Tried to create a transparent sighash for a tx without transparent data");
                 return false;
             }
-        };
-
-        SignableInput::Transparent {
-            // This conversion to `u8` is always fine:
-            // - We only call this FFI method once we already know we are using ZIP 244.
-            // - Even if we weren't, `hash_type` is one byte tacked onto the end of a
-            //   signature, so it always fits into a `u8` (and TBH I don't know why we
-            //   ever set it to `u32`).
-            hash_type: hash_type.try_into().unwrap(),
-            index,
-            // `script_code` is unused by `v5_signature_hash`, so instead of passing the
-            // real `script_code` across the FFI (and paying the serialization and parsing
-            // cost for no benefit), we set it to the prevout's `script_pubkey`. This
-            // happens to be correct anyway for every output script kind except P2SH.
-            script_code: &prevout.script_pubkey,
-            script_pubkey: &prevout.script_pubkey,
-            value: prevout.value,
         }
     };
 

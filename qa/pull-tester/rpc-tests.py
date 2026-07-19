@@ -35,14 +35,18 @@ SERIAL_SCRIPTS = [
     'wallet_shieldingcoinbase.py',
 ]
 
+FLAKY_SCRIPTS = [
+    # These tests have intermittent failures that we haven't diagnosed yet.
+    'mempool_nu_activation.py', # this *may* be fixed
+    'mempool_packages.py',
+]
+
 BASE_SCRIPTS= [
-    # Scripts that are run by the travis build process
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv
     'wallet.py',
     'sprout_sapling_migration.py',
     'remove_sprout_shielding.py',
-    'mempool_packages.py',
     # vv Tests less than 2m vv
     'mergetoaddress_mixednotes.py',
     'wallet_shieldcoinbase_sapling.py',
@@ -65,11 +69,15 @@ BASE_SCRIPTS= [
     'wallet_golden_5_6_0.py',
     'wallet_tarnished_5_6_0.py',
     # vv Tests less than 60s vv
+    'orchard_action_identity_point.py',
+    'sapling_v4_value_balance.py',
     'orchard_reorg.py',
     'fundrawtransaction.py',
     'reorg_limit.py',
     'mempool_limit.py',
     'p2p-fullblocktest.py',
+    'soft_fork_disabling_orchard.py',
+    'orchard_nu6_2.py',
     # vv Tests less than 30s vv
     'wallet_1941.py',
     'wallet_accounts.py',
@@ -89,6 +97,7 @@ BASE_SCRIPTS= [
     'wallet_sendmany_any_taddr.py',
     'wallet_treestate.py',
     'wallet_unified_change.py',
+    'wallet_zip317_default.py',
     'listtransactions.py',
     'mempool_resurrect_test.py',
     'txn_doublespend.py',
@@ -99,7 +108,6 @@ BASE_SCRIPTS= [
     'rest.py',
     'mempool_spendcoinbase.py',
     'mempool_reorg.py',
-    'mempool_nu_activation.py',
     'httpbasics.py',
     'multi_rpc.py',
     'zapwallettxes.py',
@@ -127,6 +135,12 @@ BASE_SCRIPTS= [
     'rewind_index.py',
     'p2p_txexpiry_dos.py',
     'p2p_txexpiringsoon.py',
+    'p2p_duplicate_block_clobbers_chain_value.py',
+    'p2p_ban_pool_value_out_of_range.py',
+    'legacy_chain_supply_abort.py',
+    'chain_supply_checkpoint.py',
+    'shielded_balance_accounting_coinbase.py',
+    'shielded_balance_accounting_noncoinbase.py',
     'p2p_node_bloom.py',
     'regtest_signrawtransaction.py',
     'shorter_block_times.py',
@@ -134,9 +148,11 @@ BASE_SCRIPTS= [
     'coinbase_funding_streams.py',
     'framework.py',
     'sapling_rewind_check.py',
+    'feature_nu6_1.py',
     'feature_zip221.py',
     'feature_zip239.py',
     'feature_zip244_blockcommitments.py',
+    'nu5_block_body_poisoning.py',
     'upgrade_golden.py',
     'nuparams.py',
     'post_heartwood_rollback.py',
@@ -149,6 +165,7 @@ BASE_SCRIPTS= [
     'threeofthreerestore.py',
     'show_help.py',
     'errors.py',
+    'converttex.py',
 ]
 
 ZMQ_SCRIPTS = [
@@ -178,7 +195,7 @@ EXTENDED_SCRIPTS = [
     'wallet_db_flush.py',
 ]
 
-ALL_SCRIPTS = SERIAL_SCRIPTS + BASE_SCRIPTS + ZMQ_SCRIPTS + EXTENDED_SCRIPTS
+ALL_SCRIPTS = SERIAL_SCRIPTS + FLAKY_SCRIPTS + BASE_SCRIPTS + ZMQ_SCRIPTS + EXTENDED_SCRIPTS
 
 def main():
     # Parse arguments and pass through unrecognised args
@@ -190,7 +207,7 @@ def main():
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--coverage', action='store_true', help='generate a basic coverage report for the RPC interface')
     parser.add_argument('--deterministic', '-d', action='store_true', help='make the output a bit closer to deterministic in order to compare runs.')
-    parser.add_argument('--exclude', '-x', help='specify a comma-seperated-list of scripts to exclude. Do not include the .py extension in the name.')
+    parser.add_argument('--exclude', '-x', help='specify a comma-separated-list of scripts to exclude. Do not include the .py extension in the name.')
     parser.add_argument('--extended', action='store_true', help='run the extended test suite in addition to the basic tests')
     parser.add_argument('--force', '-f', action='store_true', help='run tests even on platforms where they are disabled by default (e.g. windows).')
     parser.add_argument('--help', '-h', '-?', action='store_true', help='print help text and exit')
@@ -247,7 +264,7 @@ def main():
     else:
         # No individual tests have been specified. Run base tests, and
         # optionally ZMQ tests and extended tests.
-        test_list = SERIAL_SCRIPTS + BASE_SCRIPTS
+        test_list = SERIAL_SCRIPTS + FLAKY_SCRIPTS + BASE_SCRIPTS
         if enable_zmq:
             test_list += ZMQ_SCRIPTS
         if args.extended:
@@ -363,8 +380,15 @@ def run_tests(test_handler, test_list, src_dir, build_dir, exeext, jobs=1, enabl
             results.append(new_result)
     except (InterruptedError, KeyboardInterrupt):
         print('\nThe following tests were running when interrupted:')
+        now = time.time()
         for j in job_queue.jobs:
-            print("•", j[0])
+            (name, time0, _proc, _log_out, _log_err) = j
+            print("•", name)
+            total_count += 1
+            new_result = "%s | %s" % (name.ljust(max_len_name), "INTR".ljust(6))
+            if not deterministic:
+                new_result += (" | %s s" % (int(now - time0),))
+            results.append(new_result)
         print('\n', end='')
 
     all_passed = passed_count == total_count

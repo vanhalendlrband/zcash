@@ -11,10 +11,11 @@
 
 // Deprecation policy:
 // Per https://zips.z.cash/zip-0200
-// Shut down nodes running this version of code, 16 weeks' worth of blocks after the estimated
-// release block height. A warning is shown during the 14 days' worth of blocks prior to shut down.
-static const int APPROX_RELEASE_HEIGHT = 2129776;
-static const int RELEASE_TO_DEPRECATION_WEEKS = 16;
+// Shut down nodes running this version of code, `RELEASE_TO_DEPRECATION_WEEKS` weeks' worth
+// of blocks after the estimated release block height. A warning is shown during the 14 days'
+// worth of blocks prior to shut down.
+static const int APPROX_RELEASE_HEIGHT = 3360652;
+static const int RELEASE_TO_DEPRECATION_WEEKS = 7;
 static const int EXPECTED_BLOCKS_PER_HOUR = 3600 / Consensus::POST_BLOSSOM_POW_TARGET_SPACING;
 static_assert(EXPECTED_BLOCKS_PER_HOUR == 48, "The value of Consensus::POST_BLOSSOM_POW_TARGET_SPACING was chosen such that this assertion holds.");
 static const int ACTIVATION_TO_DEPRECATION_BLOCKS = (RELEASE_TO_DEPRECATION_WEEKS * 7 * 24 * EXPECTED_BLOCKS_PER_HOUR);
@@ -26,26 +27,32 @@ static const int DEPRECATION_WARN_LIMIT = 14 * 24 * EXPECTED_BLOCKS_PER_HOUR;
 //! Defaults for -allowdeprecated
 static const std::set<std::string> DEFAULT_ALLOW_DEPRECATED{{
     // Node-level features
-    "gbt_oldhashes",
-    "deprecationinfo_deprecationheight",
+    "createrawtransaction",
+    "signrawtransaction",
+    "getnetworkhashps",
 
     // Wallet-level features
 #ifdef ENABLE_WALLET
-    "z_getbalance",
     "z_gettotalbalance",
+    "fundrawtransaction",
+    "keypoolrefill",
+    "settxfee",
 #endif
 }};
 static const std::set<std::string> DEFAULT_DENY_DEPRECATED{{
     // Node-level features
+    "gbt_oldhashes",
+    "deprecationinfo_deprecationheight",
+    "addrtype",
 
     // Wallet-level features
 #ifdef ENABLE_WALLET
-    "legacy_privacy",
     "getnewaddress",
     "getrawchangeaddress",
     "z_getnewaddress",
+    "z_getbalance",
     "z_listaddresses",
-    "addrtype",
+    "legacy_privacy",
     "wallettxvjoinsplit",
 #endif
 }};
@@ -54,6 +61,9 @@ static const std::set<std::string> DEFAULT_DENY_DEPRECATED{{
 extern bool fEnableGbtOldHashes;
 extern bool fEnableDeprecationInfoDeprecationHeight;
 extern bool fEnableAddrTypeField;
+extern bool fEnableGetNetworkHashPS;
+extern bool fEnableCreateRawTransaction;
+extern bool fEnableSignRawTransaction;
 #ifdef ENABLE_WALLET
 extern bool fEnableGetNewAddress;
 extern bool fEnableGetRawChangeAddress;
@@ -63,6 +73,9 @@ extern bool fEnableZGetTotalBalance;
 extern bool fEnableZListAddresses;
 extern bool fEnableLegacyPrivacyStrategy;
 extern bool fEnableWalletTxVJoinSplit;
+extern bool fEnableFundRawTransaction;
+extern bool fEnableKeyPoolRefill;
+extern bool fEnableSetTxFee;
 #endif
 
 /**
@@ -95,5 +108,10 @@ std::optional<std::string> LoadAllowedDeprecatedFeatures();
  * CLI option.
  */
 std::string GetAllowableDeprecatedFeatures();
+
+/**
+ * Returns a string to be included in the help text of a deprecated RPC method.
+ */
+std::string Deprecated(bool enabled, std::string method, std::string instead);
 
 #endif // ZCASH_DEPRECATION_H

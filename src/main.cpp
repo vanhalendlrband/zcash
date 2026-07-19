@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2014 The Bitcoin Core developers
-// Copyright (c) 2015-2023 The Zcash developers
+// Copyright (c) 2015-2025 The Zcash developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <sstream>
+#include <unordered_map>
 #include <variant>
 
 #include <boost/algorithm/string/replace.hpp>
@@ -102,7 +103,6 @@ bool fIBDSkipTxVerification = DEFAULT_IBD_SKIP_TX_VERIFICATION;
 bool fCoinbaseEnforcedShieldingEnabled = true;
 size_t nCoinCacheUsage = 5000 * 300;
 uint64_t nPruneTarget = 0;
-bool fAlerts = DEFAULT_ALERTS;
 int64_t nMaxTipAge = DEFAULT_MAX_TIP_AGE;
 
 std::optional<unsigned int> expiryDeltaArg = std::nullopt;
@@ -114,12 +114,22 @@ CAmount nTxUnpaidActionLimit = DEFAULT_TX_UNPAID_ACTION_LIMIT;
 
 CTxMemPool mempool(::minRelayTxFee);
 
+struct IteratorComparator
+{
+    template<typename I>
+    bool operator()(const I& a, const I& b) const
+    {
+        return &(*a) < &(*b);
+    }
+};
+
 struct COrphanTx {
     CTransaction tx;
     NodeId fromPeer;
+    int64_t nTimeExpire;
 };
-map<uint256, COrphanTx> mapOrphanTransactions GUARDED_BY(cs_main);;
-map<uint256, set<uint256> > mapOrphanTransactionsByPrev GUARDED_BY(cs_main);;
+map<uint256, COrphanTx> mapOrphanTransactions GUARDED_BY(cs_main);
+map<COutPoint, set<map<uint256, COrphanTx>::iterator, IteratorComparator>> mapOrphanTransactionsByPrev GUARDED_BY(cs_main);
 void EraseOrphansFor(NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 /**
@@ -205,7 +215,7 @@ namespace {
     CBlockIndex *pindexBestInvalid;
 
     /**
-     * The set of all CBlockIndex entries with BLOCK_VALID_TRANSACTIONS (for itself and all ancestors) and
+     * The set of all CBlockIndex entries with BLOCK_PARTIALLY_VALID_TRANSACTIONS (for itself and all ancestors) and
      * as good as our current tip or better. Entries may be failed, though, and pruning nodes may be
      * missing the data for the block.
      */
@@ -665,40 +675,42 @@ bool AddOrphanTx(const CTransaction& tx, NodeId peer) EXCLUSIVE_LOCKS_REQUIRED(c
     // large transaction with a missing parent then we assume
     // it will rebroadcast it later, after the parent transaction(s)
     // have been mined or received.
-    // 10,000 orphans, each of which is at most 5,000 bytes big is
-    // at most 500 megabytes of orphans:
+    // 100 orphans, each of which is at most 99,999 bytes big is
+    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):
     unsigned int sz = GetSerializeSize(tx, SER_NETWORK, tx.nVersion);
-    if (sz > 5000)
+    if (sz >= 100000)
     {
         LogPrint("mempool", "ignoring large orphan tx (size: %u, hash: %s)\n", sz, hash.ToString());
         return false;
     }
 
-    mapOrphanTransactions[hash].tx = tx;
-    mapOrphanTransactions[hash].fromPeer = peer;
-    for (const CTxIn& txin : tx.vin)
-        mapOrphanTransactionsByPrev[txin.prevout.hash].insert(hash);
+    auto ret = mapOrphanTransactions.emplace(hash, COrphanTx{tx, peer, GetTime() + ORPHAN_TX_EXPIRE_TIME});
+    assert(ret.second);
+    for (const CTxIn& txin : tx.vin) {
+        mapOrphanTransactionsByPrev[txin.prevout].insert(ret.first);
+    }
 
-    LogPrint("mempool", "stored orphan tx %s (mapsz %u prevsz %u)\n", hash.ToString(),
+    LogPrint("mempool", "stored orphan tx %s (mapsz %u outsz %u)\n", hash.ToString(),
              mapOrphanTransactions.size(), mapOrphanTransactionsByPrev.size());
     return true;
 }
 
-void static EraseOrphanTx(uint256 hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+int static EraseOrphanTx(uint256 hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
     map<uint256, COrphanTx>::iterator it = mapOrphanTransactions.find(hash);
     if (it == mapOrphanTransactions.end())
-        return;
+        return 0;
     for (const CTxIn& txin : it->second.tx.vin)
     {
-        map<uint256, set<uint256> >::iterator itPrev = mapOrphanTransactionsByPrev.find(txin.prevout.hash);
+        auto itPrev = mapOrphanTransactionsByPrev.find(txin.prevout);
         if (itPrev == mapOrphanTransactionsByPrev.end())
             continue;
-        itPrev->second.erase(hash);
+        itPrev->second.erase(it);
         if (itPrev->second.empty())
             mapOrphanTransactionsByPrev.erase(itPrev);
     }
     mapOrphanTransactions.erase(it);
+    return 1;
 }
 
 void EraseOrphansFor(NodeId peer)
@@ -710,8 +722,7 @@ void EraseOrphansFor(NodeId peer)
         map<uint256, COrphanTx>::iterator maybeErase = iter++; // increment to avoid iterator becoming invalid
         if (maybeErase->second.fromPeer == peer)
         {
-            EraseOrphanTx(maybeErase->second.tx.GetHash());
-            ++nErased;
+            nErased += EraseOrphanTx(maybeErase->second.tx.GetHash());
         }
     }
     if (nErased > 0) LogPrint("mempool", "Erased %d orphan tx from peer %d\n", nErased, peer);
@@ -721,6 +732,28 @@ void EraseOrphansFor(NodeId peer)
 unsigned int LimitOrphanTxSize(unsigned int nMaxOrphans) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
     unsigned int nEvicted = 0;
+    static int64_t nNextSweep;
+    int64_t nNow = GetTime();
+    if (nNextSweep <= nNow) {
+        // Sweep out expired orphan pool entries:
+        int nErased = 0;
+        assert(nNow <= INT64_MAX - ORPHAN_TX_EXPIRE_TIME);
+        int64_t nMinExpTime = nNow + ORPHAN_TX_EXPIRE_TIME - ORPHAN_TX_EXPIRE_INTERVAL;
+        map<uint256, COrphanTx>::iterator iter = mapOrphanTransactions.begin();
+        while (iter != mapOrphanTransactions.end())
+        {
+            map<uint256, COrphanTx>::iterator maybeErase = iter++;
+            if (maybeErase->second.nTimeExpire <= nNow) {
+                nErased += EraseOrphanTx(maybeErase->second.tx.GetHash());
+            } else {
+                nMinExpTime = std::min(maybeErase->second.nTimeExpire, nMinExpTime);
+            }
+        }
+        // Sweep again 5 minutes after the next entry that expires in order to batch the linear scan.
+        assert(nMinExpTime <= INT64_MAX - ORPHAN_TX_EXPIRE_INTERVAL);
+        nNextSweep = nMinExpTime + ORPHAN_TX_EXPIRE_INTERVAL;
+        if (nErased > 0) LogPrint("mempool", "Erased %d orphan tx due to expiration\n", nErased);
+    }
     while (mapOrphanTransactions.size() > nMaxOrphans)
     {
         // Evict a random orphan:
@@ -850,7 +883,7 @@ bool ContextualCheckTransaction(
     auto dosLevelPotentiallyRelaxing = isMined ? DOS_LEVEL_BLOCK : (
         isInitBlockDownload(chainparams.GetConsensus()) ? 0 : DOS_LEVEL_MEMPOOL);
 
-    auto consensus = chainparams.GetConsensus();
+    auto& consensus = chainparams.GetConsensus();
     auto consensusBranchId = CurrentEpochBranchId(nHeight, consensus);
 
     bool overwinterActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_OVERWINTER);
@@ -859,13 +892,19 @@ bool ContextualCheckTransaction(
     bool heartwoodActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_HEARTWOOD);
     bool canopyActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY);
     bool nu5Active = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU5);
+    bool nu6Active = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU6);
+    bool nu6point1Active = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU6_1);
+    bool nu6point2Active = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU6_2);
     bool futureActive = consensus.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_ZFUTURE);
 
     assert(!saplingActive || overwinterActive); // Sapling cannot be active unless Overwinter is
     assert(!heartwoodActive || saplingActive);  // Heartwood cannot be active unless Sapling is
     assert(!canopyActive || heartwoodActive);   // Canopy cannot be active unless Heartwood is
     assert(!nu5Active || canopyActive);         // NU5 cannot be active unless Canopy is
-    assert(!futureActive || nu5Active);         // ZFUTURE must include consensus rules for all supported network upgrades.
+    assert(!nu6Active || nu5Active);            // NU6 cannot be active unless NU5 is
+    assert(!nu6point1Active || nu6Active);      // NU6.1 cannot be active unless NU6 is
+    assert(!nu6point2Active || nu6point1Active); // NU6.2 cannot be active unless NU6.1 is
+    assert(!futureActive || nu6point2Active);   // ZFUTURE must include consensus rules for all supported network upgrades.
 
     auto& orchard_bundle = tx.GetOrchardBundle();
 
@@ -972,10 +1011,7 @@ bool ContextualCheckTransaction(
     // ZIP 207 consensus funding streams active at the current block height. To avoid
     // double-decrypting, we detect any shielded funding streams during the Heartwood
     // consensus check. If Canopy is not yet active, fundingStreamElements will be empty.
-    std::set<Consensus::FundingStreamElement> fundingStreamElements = Consensus::GetActiveFundingStreamElements(
-        nHeight,
-        GetBlockSubsidy(nHeight, consensus),
-        consensus);
+    auto fundingStreamElements = consensus.GetActiveFundingStreamElements(nHeight);
 
     // Rules that apply to Heartwood and later:
     if (heartwoodActive) {
@@ -1068,6 +1104,15 @@ bool ContextualCheckTransaction(
                 for (auto it = fundingStreamElements.begin(); it != fundingStreamElements.end(); ++it) {
                     const CScript* taddr = std::get_if<CScript>(&(it->first));
                     if (taddr && output.scriptPubKey == *taddr && output.nValue == it->second) {
+                        fundingStreamElements.erase(it);
+                        break;
+                    }
+                }
+            }
+
+            if (nu6Active) {
+                for (auto it = fundingStreamElements.begin(); it != fundingStreamElements.end(); ++it) {
+                    if (std::holds_alternative<Consensus::Lockbox>(it->first)) {
                         fundingStreamElements.erase(it);
                         break;
                     }
@@ -1204,6 +1249,56 @@ bool ContextualCheckTransaction(
                 dosLevelPotentiallyRelaxing,
                 error("ContextualCheckTransaction(): pre-NU5 transaction has consensus branch id set"),
                 REJECT_INVALID, "bad-tx-has-consensus-branch-id");
+        }
+    }
+
+    // Rules that apply to NU6.1 or later:
+    if (nu6point1Active) {
+        if (tx.IsCoinBase()) {
+            // Get the set of expected one-time lockbox disbursements, and ensure that the
+            // coinbase transaction contains them.
+            auto lockboxDisbursements = consensus.GetLockboxDisbursementsForHeight(nHeight);
+
+            // Only iterate over the coinbase outputs if this is an activation block.
+            if (!lockboxDisbursements.empty()) {
+                // Note that this logic relies on the set of recipient addresses for lockbox
+                // disbursements being disjoint from the set of funding stream recipients.
+                for (const CTxOut& output : tx.vout) {
+                    for (auto it = lockboxDisbursements.begin(); it != lockboxDisbursements.end(); ++it) {
+                        if (output.scriptPubKey == it->GetRecipient() && output.nValue == it->GetAmount()) {
+                            lockboxDisbursements.erase(it);
+                            break;
+                        }
+                    }
+                }
+
+                if (!lockboxDisbursements.empty()) {
+                    return state.DoS(100, error("ContextualCheckTransaction(): lockbox disbursement missing at height %d", nHeight),
+                                    REJECT_INVALID, "cb-lockbox-disbursement-missing");
+                }
+            }
+        }
+    }
+
+    // Rules that apply to NU6.2 or later:
+    if (nu6point2Active) {
+        // - The Orchard verifying key change is in the `orchard::init_batch_validator`
+        //   constructor, in AcceptToMemoryPool and ConnectBlock.
+        // - Orchard proof size enforcement is in the Rust `Transaction` parser.
+    } else {
+        // Rules that apply generally before NU6.2. These were previously
+        // noncontextual checks that became contextual after NU6.2 activation.
+
+        // Soft fork: temporarily require transactions to not contain Orchard actions.
+        //
+        // This soft fork was added while NU 6.1 was the active epoch on the Zcash chain, but
+        // we apply it uniformly even if NU 6.1 is not active in case it is ported to other
+        // chains with a different sequence of NUs.
+        if (consensus.TemporaryOrchardDisablingSoftForkActive(nHeight) &&
+                orchard_bundle.IsPresent()) {
+            return state.Invalid(
+                error("ContextualCheckTransaction(): transaction has Orchard actions (temporarily disabled)"),
+                REJECT_INVALID, "bad-tx-has-orchard-actions");
         }
     }
 
@@ -1417,6 +1512,17 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
         }
     }
     auto orchard_bundle = tx.GetOrchardBundle();
+
+    // Check Orchard action fields that are not validated by the proof circuit:
+    // - rk must not be the identity (causes a crash in proof verification)
+    // - epk must encode a valid, non-identity Pallas curve point (consensus
+    //   rule per §5.4.9.4 of the protocol spec); this rejects the all-zeros
+    //   identity encoding, non-canonical x (x >= q_P), and canonical x for
+    //   which no curve point exists.
+    if (!orchard_bundle.ValidateWithoutProofVerification()) {
+        return state.DoS(100, error("CheckTransaction(): invalid Orchard action field encoding"),
+                         REJECT_INVALID, "bad-orchard-action-identity-point");
+    }
 
     // Transactions must contain some potential source of funds. This rejects
     // obviously-invalid transaction constructions early, but cannot prevent
@@ -1680,6 +1786,22 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             return state.DoS(100, error("CheckTransaction(): coinbase has enableSpendsOrchard set"),
                              REJECT_INVALID, "bad-cb-has-orchard-spend");
 
+        // A coinbase transaction has no Sapling spends or spend-enabled Orchard
+        // actions (rejected above), so its shielded value balance is the negation
+        // of the value of its shielded outputs and cannot be positive. A positive
+        // value balance would be unsatisfiable by the binding signature, hence
+        // always invalid (independently of the NU6 exact-coinbase-balance rule).
+        // Rejecting it here, rather than only via the binding-signature check in
+        // ConnectBlock, prevents a malformed coinbase from reaching the chain
+        // supply consistency check with inconsistent pool accounting
+        // (GHSA-g4x5-crjh-29ff).
+        if (tx.GetValueBalanceSapling() > 0)
+            return state.DoS(100, error("CheckTransaction(): coinbase has positive Sapling value balance"),
+                             REJECT_INVALID, "bad-cb-positive-sapling-valuebalance");
+        if (orchard_bundle.GetValueBalance() > 0)
+            return state.DoS(100, error("CheckTransaction(): coinbase has positive Orchard value balance"),
+                             REJECT_INVALID, "bad-cb-positive-orchard-valuebalance");
+
         if (tx.vin[0].scriptSig.size() < 2 || tx.vin[0].scriptSig.size() > 100)
             return state.DoS(100, false, REJECT_INVALID, "bad-cb-length");
     }
@@ -1813,14 +1935,22 @@ bool AcceptToMemoryPool(
         // Bring the best block into scope
         view.GetBestBlock();
 
-        nValueIn = view.GetValueIn(tx);
+        try {
+            nValueIn = view.GetValueIn(tx);
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-input-value-out-of-range");
+        }
 
         // we have all inputs cached now, so switch back to dummy
         view.SetBackend(dummy);
 
         // Check for non-standard pay-to-script-hash in inputs
-        if (chainparams.RequireStandard() && !AreInputsStandard(tx, view, consensusBranchId))
-            return state.Invalid(false, REJECT_NONSTANDARD, "bad-txns-nonstandard-inputs");
+        try {
+            if (chainparams.RequireStandard() && !AreInputsStandard(tx, view, consensusBranchId))
+                return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-nonstandard-inputs", BodyCorruption::Possible);
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-input-value-out-of-range");
+        }
 
         // Check that the transaction doesn't have an excessive number of
         // sigops, making it impossible to mine. Since the coinbase transaction
@@ -1828,12 +1958,21 @@ bool AcceptToMemoryPool(
         // MAX_BLOCK_SIGOPS; we still consider this an invalid rather than
         // merely non-standard transaction.
         unsigned int nSigOps = GetLegacySigOpCount(tx);
-        nSigOps += GetP2SHSigOpCount(tx, view);
+        try {
+            nSigOps += GetP2SHSigOpCount(tx, view);
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-input-value-out-of-range");
+        }
         if (nSigOps > MAX_STANDARD_TX_SIGOPS)
-            return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-too-many-sigops", false,
+            return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-too-many-sigops", BodyCorruption::Possible,
                 strprintf("%d > %d", nSigOps, MAX_STANDARD_TX_SIGOPS));
 
-        CAmount nValueOut = tx.GetValueOut();
+        CAmount nValueOut;
+        try {
+            nValueOut = tx.GetValueOut();
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-output-value-out-of-range");
+        }
         CAmount nFees = nValueIn-nValueOut;
         // nModifiedFees includes any fee deltas from PrioritiseTransaction
         CAmount nModifiedFees = nFees;
@@ -1880,7 +2019,8 @@ bool AcceptToMemoryPool(
                     ", which is over the limit of %d. The conventional fee for this transaction is %d " + MINOR_CURRENCY_UNIT,
                     tx.GetHash().ToString(), nSize, nModifiedFees, nModifiedFees - nFees, nUnpaidActionCount,
                     nTxUnpaidActionLimit, tx.GetConventionalFee());
-            return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "tx unpaid action limit exceeded");
+            return state.DoS(0, false, REJECT_INSUFFICIENTFEE,
+                             strprintf("tx unpaid action limit exceeded: %d action(s) exceeds limit of %d", nUnpaidActionCount, nTxUnpaidActionLimit));
         }
 
         if (fRejectAbsurdFee && nFees > maxTxFee) {
@@ -1897,14 +2037,18 @@ bool AcceptToMemoryPool(
         size_t nLimitDescendantSize = GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT)*1000;
         std::string errString;
         if (!pool.CalculateMemPoolAncestors(entry, setAncestors, nLimitAncestors, nLimitAncestorSize, nLimitDescendants, nLimitDescendantSize, errString)) {
-            return state.DoS(0, false, REJECT_NONSTANDARD, "too-long-mempool-chain", false, errString);
+            return state.DoS(0, false, REJECT_NONSTANDARD, "too-long-mempool-chain", BodyCorruption::Default, errString);
         }
 
         // Check against previous transactions
         // This is done near the end to help prevent CPU exhaustion denial-of-service attacks.
         std::vector<CTxOut> allPrevOutputs;
-        for (const auto& input : tx.vin) {
-            allPrevOutputs.push_back(view.GetOutputFor(input));
+        try {
+            for (const auto& input : tx.vin) {
+                allPrevOutputs.push_back(view.GetOutputFor(input));
+            }
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-input-value-out-of-range");
         }
         PrecomputedTransactionData txdata(tx, allPrevOutputs);
         if (!ContextualCheckInputs(tx, state, view, true, STANDARD_SCRIPT_VERIFY_FLAGS, true, txdata, chainparams.GetConsensus(), consensusBranchId))
@@ -1933,8 +2077,12 @@ bool AcceptToMemoryPool(
         std::optional<rust::Box<sapling::BatchValidator>> saplingAuth = sapling::init_batch_validator(true);
 
         // This will be a single-transaction batch, which is still more efficient as every
-        // Orchard bundle contains at least two signatures.
-        std::optional<rust::Box<orchard::BatchValidator>> orchardAuth = orchard::init_batch_validator(true);
+        // Orchard bundle contains at least two signatures. The batch is typed to the Orchard
+        // circuit in force at the next block height: NU6.2 changed the circuit and thus the
+        // verifying key.
+        std::optional<rust::Box<orchard::BatchValidator>> orchardAuth = orchard::init_batch_validator(
+            true,
+            chainparams.GetConsensus().NetworkUpgradeActive(nextBlockHeight, Consensus::UPGRADE_NU6_2));
 
         // Check shielded input signatures.
         if (!ContextualCheckShieldedInputs(
@@ -1965,14 +2113,18 @@ bool AcceptToMemoryPool(
             // Store transaction in memory
             pool.addUnchecked(hash, entry, setAncestors);
 
-            // Add memory address index
-            if (fAddressIndex) {
-                pool.addAddressIndex(entry, view);
-            }
+            try {
+                // Add memory address index
+                if (fAddressIndex) {
+                    pool.addAddressIndex(entry, view);
+                }
 
-            // insightexplorer: Add memory spent index
-            if (fSpentIndex) {
-                pool.addSpentIndex(entry, view);
+                // insightexplorer: Add memory spent index
+                if (fSpentIndex) {
+                    pool.addSpentIndex(entry, view);
+                }
+            } catch (const std::runtime_error& e) {
+                return state.DoS(100, false, REJECT_INVALID, "bad-txns-input-value-out-of-range");
             }
 
             pool.EnsureSizeLimit();
@@ -2054,9 +2206,9 @@ bool GetAddressUnspent(const uint160& addressHash, int type,
  * Return transaction in txOut, and if it was found inside a block, its hash is placed in hashBlock.
  * If blockIndex is provided, the transaction is fetched from the corresponding block.
  */
-bool GetTransaction(const uint256& hash, CTransaction& txOut, const Consensus::Params& consensusParams, uint256& hashBlock, bool fAllowSlow, CBlockIndex* blockIndex)
+bool GetTransaction(const uint256& hash, CTransaction& txOut, const Consensus::Params& consensusParams, uint256& hashBlock, bool fAllowSlow, const CBlockIndex* blockIndex)
 {
-    CBlockIndex* pindexSlow = blockIndex;
+    const CBlockIndex* pindexSlow = blockIndex;
 
     LOCK(cs_main);
 
@@ -2187,45 +2339,6 @@ bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus
     return true;
 }
 
-CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
-{
-    CAmount nSubsidy = 12.5 * COIN;
-
-    // Mining slow start
-    // The subsidy is ramped up linearly, skipping the middle payout of
-    // MAX_SUBSIDY/2 to keep the monetary curve consistent with no slow start.
-    if (nHeight < consensusParams.SubsidySlowStartShift()) {
-        nSubsidy /= consensusParams.nSubsidySlowStartInterval;
-        nSubsidy *= nHeight;
-        return nSubsidy;
-    } else if (nHeight < consensusParams.nSubsidySlowStartInterval) {
-        nSubsidy /= consensusParams.nSubsidySlowStartInterval;
-        nSubsidy *= (nHeight+1);
-        return nSubsidy;
-    }
-
-    assert(nHeight >= consensusParams.SubsidySlowStartShift());
-
-    int halvings = consensusParams.Halving(nHeight);
-
-    // Force block reward to zero when right shift is undefined.
-    if (halvings >= 64)
-        return 0;
-
-    // zip208
-    // BlockSubsidy(height) :=
-    // SlowStartRate · height, if height < SlowStartInterval / 2
-    // SlowStartRate · (height + 1), if SlowStartInterval / 2 ≤ height and height < SlowStartInterval
-    // floor(MaxBlockSubsidy / 2^Halving(height)), if SlowStartInterval ≤ height and not IsBlossomActivated(height)
-    // floor(MaxBlockSubsidy / (BlossomPoWTargetSpacingRatio · 2^Halving(height))), otherwise
-    if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_BLOSSOM)) {
-        return (nSubsidy / Consensus::BLOSSOM_POW_TARGET_SPACING_RATIO) >> halvings;
-    } else {
-        // Subsidy is cut in half every 840,000 blocks which will occur approximately every 4 years.
-        return nSubsidy >> halvings;
-    }
-}
-
 static std::atomic<bool> IBDLatchToFalse{false};
 // testing-only, allow initial block down state to be set or reset
 bool TestSetIBD(bool ibd) {
@@ -2330,7 +2443,7 @@ void CheckForkWarningConditions(const Consensus::Params& params)
         {
             std::string warning = std::string("'Warning: Large-work fork detected, forking after block ") +
                 pindexBestForkBase->phashBlock->ToString() + std::string("'");
-            CAlert::Notify(warning, true);
+            AlertNotify(warning, true);
         }
         if (pindexBestForkTip && pindexBestForkBase)
         {
@@ -2343,7 +2456,7 @@ void CheckForkWarningConditions(const Consensus::Params& params)
         {
             std::string warning = std::string("Warning: Found invalid chain at least ~6 blocks longer than our best chain.\nChain state database corruption likely.");
             LogPrintf("%s: %s\n", warning.c_str(), __func__);
-            CAlert::Notify(warning, true);
+            AlertNotify(warning, true);
             SetfLargeWorkInvalidChainFound(true);
         }
     }
@@ -2424,6 +2537,83 @@ void static InvalidChainFound(CBlockIndex* pindexNew, const CChainParams& chainP
     CheckForkWarningConditions(chainParams.GetConsensus());
 }
 
+/**
+ * Reset body state on `root` and every descendant of `root` in
+ * `mapBlockIndex`, post-order so that each descendant's `nChainTx` is
+ * cleared before its parent's. Caller must hold `cs_main`. Used by
+ * `InvalidBlockFound` to handle a body-replaceable failure on a block
+ * that may have descendants with their own bodies (the sidechain
+ * case): leaving descendant `nChainTx > 0` while the root's `nChainTx`
+ * is zero would violate `CheckBlockIndex`'s `pindexFirstNeverProcessed`
+ * invariant on each such descendant, and let `FindMostWorkChain` walk
+ * through the stranded subtree.
+ *
+ * Runs in O(n + m), where n = |mapBlockIndex| and m = |subtree|, by
+ * precomputing a parent -> children map once. A naive per-node
+ * `mapBlockIndex` scan would be O(n * m); on a large adversary-grown
+ * header tree under `root` that becomes a quadratic-cost path under
+ * `cs_main`.
+ */
+static void ResetBodyStateForSubtree(CBlockIndex* root)
+{
+    AssertLockHeld(cs_main);
+
+    // Build a parent -> children map once over `mapBlockIndex`. Subsequent
+    // subtree traversal and per-node descendant checks are then O(1) per
+    // edge.
+    std::unordered_map<const CBlockIndex*, std::vector<CBlockIndex*>> children;
+    children.reserve(mapBlockIndex.size());
+    for (const auto& entry : mapBlockIndex) {
+        CBlockIndex* p = entry.second;
+        if (p->pprev != nullptr) {
+            children[p->pprev].push_back(p);
+        }
+    }
+
+    // Collect the subtree rooted at `root`, ancestors before descendants,
+    // walking children directly via the precomputed map.
+    std::vector<CBlockIndex*> subtree = {root};
+    for (size_t i = 0; i < subtree.size(); ++i) {
+        const auto cit = children.find(subtree[i]);
+        if (cit != children.end()) {
+            subtree.insert(subtree.end(), cit->second.begin(), cit->second.end());
+        }
+    }
+
+    // Reset in post-order: descendants first, so by the time each ancestor
+    // is reset, the no-descendant-`nChainTx > 0` precondition already holds.
+    for (auto it = subtree.rbegin(); it != subtree.rend(); ++it) {
+        CBlockIndex* p = *it;
+        // Erase from `setBlockIndexCandidates` *before* `ResetBodyState`
+        // mutates `nSequenceId`. The set is ordered by
+        // `(nChainWork, nSequenceId, ptr)` per `CBlockIndexWorkComparator`;
+        // erasing after the mutation would fail to find `p`.
+        setBlockIndexCandidates.erase(p);
+        // Enforce `ResetBodyState`'s documented preconditions before the
+        // call rather than after the resulting index corruption surfaces
+        // (e.g. as the `pindexTest->nChainTx || pindexTest->nHeight == 0`
+        // assertion in `FindMostWorkChain`):
+        //   1. `p` is not in `setBlockIndexCandidates` (just erased above).
+        //   2. No direct child of `p` has `nChainTx > 0`. By the
+        //      `ReceivedBlockTransactions` propagation invariant
+        //      (`nChainTx` is only assigned from `pprev->nChainTx + nTx`
+        //      once the parent's `nChainTx` is non-zero), `nChainTx > 0`
+        //      propagates strictly from parent to descendant, so this is
+        //      equivalent to "no descendant has `nChainTx > 0`". The
+        //      post-order walk above has already cleared every descendant
+        //      of `p` before we reach `p` itself.
+        assert(setBlockIndexCandidates.count(p) == 0);
+        const auto cit = children.find(p);
+        if (cit != children.end()) {
+            for (const CBlockIndex* c : cit->second) {
+                assert(c->nChainTx == 0);
+            }
+        }
+        p->ResetBodyState();
+        setDirtyBlockIndex.insert(p);
+    }
+}
+
 void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state, const CChainParams& chainParams) {
     int nDoS = 0;
     if (state.IsInvalid(nDoS)) {
@@ -2436,12 +2626,29 @@ void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state
                 Misbehaving(it->second, nDoS);
         }
     }
-    if (!state.CorruptionPossible()) {
+
+    if (state.CorruptionPossible()) {
+        // Body-replaceable failure: discard persisted body data and disk
+        // pointers for `pindex` and its descendants, so a subsequent
+        // submission of a matching body for the same header can be
+        // processed normally. Do NOT mark BLOCK_FAILED_VALID, which would
+        // permanently reject the header and prevent the canonical body
+        // from ever replacing the mismatched one. The helper handles
+        // `setBlockIndexCandidates.erase` and `setDirtyBlockIndex.insert`
+        // for each node it resets, including `pindex`.
+        ResetBodyStateForSubtree(pindex);
+    } else {
         pindex->nStatus |= BLOCK_FAILED_VALID;
         setDirtyBlockIndex.insert(pindex);
         setBlockIndexCandidates.erase(pindex);
-        InvalidChainFound(pindex, chainParams);
     }
+
+    // Run `InvalidChainFound` regardless of `CorruptionPossible()`, so
+    // that operators see the invalid-block log lines and so that
+    // `pindexBestInvalid` / `CheckForkWarningConditions` always track
+    // adversarial chains. The 6-block threshold in
+    // `CheckForkWarningConditions` filters out non-fork incidents.
+    InvalidChainFound(pindex, chainParams);
 }
 
 void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
@@ -2563,17 +2770,28 @@ bool CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoins
 
         }
 
-        nValueIn += tx.GetShieldedValueIn();
+        try {
+            nValueIn += tx.GetShieldedValueIn();
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-inputvalues-outofrange");
+        }
         if (!MoneyRange(nValueIn))
             return state.DoS(100, error("CheckInputs(): shielded input to transparent value pool out of range"),
                              REJECT_INVALID, "bad-txns-inputvalues-outofrange");
 
-        if (nValueIn < tx.GetValueOut())
-            return state.DoS(100, false, REJECT_INVALID, "bad-txns-in-belowout", false,
-                strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn), FormatMoney(tx.GetValueOut())));
+        CAmount nValueOut;
+        try {
+            nValueOut = tx.GetValueOut();
+        } catch (const std::runtime_error& e) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-outputvalues-outofrange");
+        }
+
+        if (nValueIn < nValueOut)
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-in-belowout", BodyCorruption::Default,
+                strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn), FormatMoney(nValueOut)));
 
         // Tally transaction fees
-        CAmount nTxFee = nValueIn - tx.GetValueOut();
+        CAmount nTxFee = nValueIn - nValueOut;
         if (nTxFee < 0)
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-fee-negative");
         nFees += nTxFee;
@@ -2859,12 +3077,19 @@ static DisconnectResult DisconnectBlock(const CBlock& block, CValidationState& s
                 // https://github.com/bitpay/bitcoin/commit/017f548ea6d89423ef568117447e61dd5707ec42#diff-7ec3c68a81efff79b6ca22ac1f1eabbaR2304
                 const CTxIn input = tx.vin[j];
                 if (fAddressIndex && updateIndices) {
-                    const CTxOut &prevout = view.GetOutputFor(input);
+                    CTxOut prevout;
+                    try {
+                        prevout = view.GetOutputFor(input);
+                    } catch (const std::runtime_error& e) {
+                        error("DisconnectBlock(): %s", e.what());
+                        return DISCONNECT_FAILED;
+                    }
                     CScript::ScriptType scriptType = prevout.scriptPubKey.GetType();
                     if (scriptType != CScript::UNKNOWN) {
                         uint160 const addrHash = prevout.scriptPubKey.AddressHash();
 
                         // undo spending activity
+                        assert(MoneyRange(prevout.nValue));
                         addressIndex.push_back(make_pair(
                             CAddressIndexKey(scriptType, addrHash, pindex->nHeight, i, hash, j, true),
                             prevout.nValue * -1));
@@ -3018,13 +3243,33 @@ static bool ShouldCheckTransactions(const CChainParams& chainparams, const CBloc
              && Checkpoints::IsAncestorOfLastCheckpoint(chainparams.Checkpoints(), pindex));
 }
 
+static bool CheckBlockBodyAuthCommitment(
+    const CBlock& block,
+    int nHeight,
+    const CCoinsViewCache& view,
+    const Consensus::Params& consensusParams,
+    CValidationState& state,
+    std::optional<uint256>& hashAuthDataRoot,
+    std::optional<uint256>& hashChainHistoryRoot);
+
 bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
                   CCoinsViewCache& view, const CChainParams& chainparams,
                   bool fJustCheck, CheckAs blockChecks)
 {
     AssertLockHeld(cs_main);
 
-    bool fCheckAuthDataRoot = true;
+    // The block body has been received but has NOT yet been verified against the
+    // header's commitments. This reset is per-block: a single `CValidationState`
+    // is reused across successive connections in `ActivateBestChainStep`, so the
+    // flags must start false here regardless of any prior block's checks.
+    // There are two flags set by `CheckBlock` and `CheckBlockBodyAuthCommitment`
+    // (called below); until both are set, body-derived rejections are classified
+    // `corruptionPossible`. This is the sidechain counterpart to `AcceptBlock`'s
+    // active-tip pre-check. See `consensus/validation.h`.
+    state.ResetBodyCommitmentChecks();
+
+    auto consensusParams = chainparams.GetConsensus();
+
     bool fExpensiveChecks = true;
 
     switch (blockChecks) {
@@ -3035,10 +3280,11 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         // checking them twice for transactions that were already checked when
         // added to the mempool.
         fExpensiveChecks = false;
+        break;
     case CheckAs::SlowBenchmark:
-        // Disable checking the authDataRoot for block templates and slow block
-        // benchmarks.
-        fCheckAuthDataRoot = false;
+        // This case does not disable any verification work. It is retained
+        // because it disables `fCacheResults` below, so that per-tx
+        // verification results are not cached across benchmark runs.
         break;
     default:
         assert(false);
@@ -3059,8 +3305,13 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     // Disable Sapling and Orchard batch validation if possible.
     std::optional<rust::Box<sapling::BatchValidator>> saplingAuth = fExpensiveChecks ?
         std::optional(sapling::init_batch_validator(fCacheResults)) : std::nullopt;
+    // The batch is typed to the Orchard circuit in force at this block's height: NU6.2 changed
+    // the circuit and thus the verifying key.
     std::optional<rust::Box<orchard::BatchValidator>> orchardAuth = fExpensiveChecks ?
-        std::optional(orchard::init_batch_validator(fCacheResults)) : std::nullopt;
+        std::optional(orchard::init_batch_validator(
+            fCacheResults,
+            consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU6_2)))
+        : std::nullopt;
 
     // If in initial block download, and this block is an ancestor of a checkpoint,
     // and -ibdskiptxverification is set, disable all transaction checks.
@@ -3073,13 +3324,25 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         return false;
     }
 
+    // Compute hashAuthDataRoot and hashChainHistoryRoot and perform the
+    // NU5+ hashBlockCommitments check here, ahead of the per-tx loop.
+    // See `corruptionPossible` in `consensus/validation.h` — checking
+    // hashBlockCommitments first means any later per-tx auth-data failure
+    // is not body-replaceable.
+    std::optional<uint256> hashAuthDataRoot;
+    std::optional<uint256> hashChainHistoryRoot;
+    if (!CheckBlockBodyAuthCommitment(block, pindex->nHeight, view, consensusParams,
+                                      state, hashAuthDataRoot, hashChainHistoryRoot)) {
+        return false;
+    }
+
     // verify that the view's current state corresponds to the previous block
     uint256 hashPrevBlock = pindex->pprev == NULL ? uint256() : pindex->pprev->GetBlockHash();
     assert(hashPrevBlock == view.GetBestBlock());
 
     // Special case for the genesis block, skipping connection of its transactions
     // (its coinbase is unspendable)
-    if (block.GetHash() == chainparams.GetConsensus().hashGenesisBlock) {
+    if (block.GetHash() == consensusParams.hashGenesisBlock) {
         if (!fJustCheck) {
             view.SetBestBlock(pindex->GetBlockHash());
             // Before the genesis block, there was an empty tree
@@ -3091,47 +3354,104 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         return true;
     }
 
-    // Reject a block that results in a negative shielded value pool balance.
+    // For range and consistency checks that are protocol-level invariants
+    // ensured cryptographically (e.g. by the soundness of the proof systems and
+    // the binding property of commitments), we call `error` and reject the
+    // block, unless the failed check indicates unrecoverable state corruption
+    // in which case we abort.
+    //
+    // We use `assert` for programming assertions that should be tautologies
+    // given what has been checked already. These should be used conservatively
+    // due to the impact of crashing the node.
+
+    // `nChainSaplingValue`, `nChainOrchardValue`, and `nChainLockboxValue` are
+    // always populated at this point:
+    //
+    // - For normal block connection via `ConnectTip`, the block index has been
+    //   through `ReceivedBlockTransactions` which accumulates from `pprev`.
+    // - For `TestNewBlockAtTipValidity`, `SetChainPoolValues` eagerly
+    //   accumulates from `pprev == chainActive.Tip()`, which is always
+    //   populated.
+    // - For `VerifyDB`, the active chain has been fully reconstructed by
+    //   `LoadBlockIndexDB` at startup, which re-accumulates chain values for
+    //   all blocks with parents that have populated values.
+    //
+    // So `nullopt` values here indicate a programming error (independently of
+    // `chainparams.ZIP209Enabled()`).
+    assert(pindex->nChainSaplingValue.has_value());
+    assert(pindex->nChainOrchardValue.has_value());
+    assert(pindex->nChainLockboxValue.has_value());
+    const CAmount sapling_supply = pindex->nChainSaplingValue.value();
+    const CAmount orchard_supply = pindex->nChainOrchardValue.value();
+    const CAmount lockbox_supply = pindex->nChainLockboxValue.value();
+
+    // Shielded pool turnstile checks (ZIP 209)
+    //
+    // Reject a block that results in an out-of-range shielded value pool
+    // balance.
     if (chainparams.ZIP209Enabled()) {
         // Sprout
         //
-        // We can expect nChainSproutValue to be valid after the hardcoded
-        // height, and this will be enforced on all descendant blocks. If
-        // the node was reindexed then this will be enforced for all blocks.
-        if (pindex->nChainSproutValue) {
-            if (*pindex->nChainSproutValue < 0) {
-                return state.DoS(100, error("ConnectBlock(): turnstile violation in Sprout shielded value pool"),
-                             REJECT_INVALID, "turnstile-violation-sprout-shielded-pool");
-            }
+        // `nChainSproutValue` is expected to be populated here. A legacy
+        // block index written by a client older than SPROUT_VALUE_VERSION
+        // (1.0.14) may have `nSproutValue == std::nullopt` for blocks below
+        // the hardcoded Sprout value pool checkpoint height, which would
+        // propagate into `nChainSproutValue == std::nullopt`. If that
+        // happens, the node must be reindexed to recompute per-block
+        // Sprout deltas from disk.
+        if (!pindex->nChainSproutValue.has_value()) {
+            return AbortNode(
+                state,
+                strprintf(
+                    "%s: nChainSproutValue is not set for block %s at height %d; "
+                    "this indicates legacy block index data that predates Sprout "
+                    "value pool tracking. A reindex is required.",
+                    __func__,
+                    pindex->GetBlockHash().ToString(),
+                    pindex->nHeight),
+                _("The Sprout shielded value pool balance is not tracked for "
+                  "some blocks in your block index. This may indicate legacy "
+                  "data that predates Sprout value pool tracking. Please "
+                  "restart zcashd with -reindex."));
+        }
+        if (!MoneyRange(pindex->nChainSproutValue.value())) {
+            return state.DoS(100,
+                error("%s: turnstile violation in Sprout shielded value pool at height %d (sprout=%d, sapling=%d, orchard=%d, lockbox=%d)", __func__,
+                      pindex->nHeight, pindex->nChainSproutValue.value(), sapling_supply, orchard_supply, lockbox_supply),
+                REJECT_INVALID, "turnstile-violation-sprout-shielded-pool");
         }
 
         // Sapling
-        //
-        // If we've reached ConnectBlock, we have all transactions of
-        // parents and can expect nChainSaplingValue not to be std::nullopt.
-        // However, the miner and mining RPCs may not have populated this
-        // value and will call `TestBlockValidity`. So, we act
-        // conditionally.
-        if (pindex->nChainSaplingValue) {
-            if (*pindex->nChainSaplingValue < 0) {
-                return state.DoS(100, error("ConnectBlock(): turnstile violation in Sapling shielded value pool"),
-                             REJECT_INVALID, "turnstile-violation-sapling-shielded-pool");
-            }
+        if (!MoneyRange(sapling_supply)) {
+            return state.DoS(100,
+                error("%s: turnstile violation in Sapling shielded value pool at height %d (sprout=%d, sapling=%d, orchard=%d, lockbox=%d)", __func__,
+                      pindex->nHeight, pindex->nChainSproutValue.value(), sapling_supply, orchard_supply, lockbox_supply),
+                REJECT_INVALID, "turnstile-violation-sapling-shielded-pool");
         }
 
         // Orchard
-        //
-        // If we've reached ConnectBlock, we have all transactions of
-        // parents and can expect nChainOrchardValue not to be std::nullopt.
-        // However, the miner and mining RPCs may not have populated this
-        // value and will call `TestBlockValidity`. So, we act
-        // conditionally.
-        if (pindex->nChainOrchardValue) {
-            if (*pindex->nChainOrchardValue < 0) {
-                return state.DoS(100, error("ConnectBlock(): turnstile violation in Orchard shielded value pool"),
-                                 REJECT_INVALID, "turnstile-violation-orchard");
-            }
+        if (!MoneyRange(orchard_supply)) {
+            return state.DoS(100,
+                error("%s: turnstile violation in Orchard shielded value pool at height %d (sprout=%d, sapling=%d, orchard=%d, lockbox=%d)", __func__,
+                      pindex->nHeight, pindex->nChainSproutValue.value(), sapling_supply, orchard_supply, lockbox_supply),
+                REJECT_INVALID, "turnstile-violation-orchard");
         }
+    }
+
+    // Lockbox turnstile check (§ 4.17)
+    //
+    // This check is a necessary consensus rule when transaction-defined lockbox
+    // disbursement is present. zcashd will never implement v6 transactions, and
+    // so this check in practice is defending against a protocol specification
+    // error in defining the one-time lockbox disbursement(s). It should not be
+    // conditional on `chainparams.ZIP209Enabled()`.
+    if (!MoneyRange(lockbox_supply)) {
+        return state.DoS(100,
+            error("%s: invalid lockbox disbursement amount at height %d (sprout=%s, sapling=%d, orchard=%d, lockbox=%d)", __func__,
+                  pindex->nHeight,
+                  pindex->nChainSproutValue.has_value() ? strprintf("%d", pindex->nChainSproutValue.value()) : "nullopt",
+                  sapling_supply, orchard_supply, lockbox_supply),
+            REJECT_INVALID, "invalid-lockbox-disbursement-amount");
     }
 
     // Do not allow blocks that contain transactions which 'overwrite' older transactions,
@@ -3139,7 +3459,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     for (const CTransaction& tx : block.vtx) {
         const CCoins* coins = view.AccessCoins(tx.GetHash());
         if (coins && !coins->IsPruned())
-            return state.DoS(100, error("ConnectBlock(): tried to overwrite transaction"),
+            return state.DoS(100, error("%s: tried to overwrite transaction", __func__),
                              REJECT_INVALID, "bad-txns-BIP30");
     }
 
@@ -3149,9 +3469,22 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     CBlockUndo blockundo;
 
+    // `txdata` must be declared before `control` so that, by C++ LIFO
+    // destruction of automatic objects, ~CCheckQueueControl (which calls
+    // Wait() to join the script-verify worker threads) runs while `txdata`
+    // is still alive. Workers hold non-owning `PrecomputedTransactionData *`
+    // pointers into this vector via `CScriptCheck::txdata`; if `txdata` were
+    // destroyed first, those workers would dereference freed memory.
+    // The `reserve()` is also required so that subsequent `emplace_back`
+    // calls in the loop below do not reallocate and invalidate the pointers
+    // already handed to in-flight workers. See CVE-2024-52911.
+    std::vector<PrecomputedTransactionData> txdata;
+    txdata.reserve(block.vtx.size());
+
     CCheckQueueControl<CScriptCheck> control(fExpensiveChecks && nScriptCheckThreads ? &scriptcheckqueue : NULL);
 
     int64_t nTimeStart = GetTimeMicros();
+    std::vector<uint256> vOrphanErase;
     CAmount nFees = 0;
     int nInputs = 0;
     unsigned int nSigOps = 0;
@@ -3184,10 +3517,10 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     assert(view.GetSaplingAnchorAt(view.GetBestAnchor(SAPLING), sapling_tree));
 
     OrchardMerkleFrontier orchard_tree;
-    if (pindex->pprev && chainparams.GetConsensus().NetworkUpgradeActive(pindex->pprev->nHeight, Consensus::UPGRADE_NU5)) {
+    if (pindex->pprev && consensusParams.NetworkUpgradeActive(pindex->pprev->nHeight, Consensus::UPGRADE_NU5)) {
         // Verify that the view's current state corresponds to the previous block.
         assert(pindex->pprev->hashFinalOrchardRoot == view.GetBestAnchor(ORCHARD));
-        // We only call ConnectBlock() on top of the active chain's tip.
+        // We only call ConnectBlock on top of the active chain's tip.
         assert(!pindex->pprev->hashFinalOrchardRoot.IsNull());
 
         assert(view.GetOrchardAnchorAt(pindex->pprev->hashFinalOrchardRoot, orchard_tree));
@@ -3208,17 +3541,20 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     bool fUpdateSaplingSubtrees = fExperimentalLightWalletd && (view.CurrentSubtreeIndex(SAPLING) == sapling_tree.current_subtree_index());
     bool fUpdateOrchardSubtrees = fExperimentalLightWalletd && (view.CurrentSubtreeIndex(ORCHARD) == orchard_tree.current_subtree_index());
 
-    // Grab the consensus branch ID for this block and its parent
-    auto consensusBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
-    auto prevConsensusBranchId = CurrentEpochBranchId(pindex->nHeight - 1, chainparams.GetConsensus());
+    // Grab the consensus branch ID for this block.
+    auto consensusBranchId = CurrentEpochBranchId(pindex->nHeight, consensusParams);
 
-    CAmount chainSupplyDelta = 0;
+    // Initialize the chain supply delta to the value delta of the lockbox for the block,
+    // as previously computed using `SetChainPoolValues`.
+    CAmount chainSupplyDelta = pindex->nLockboxValue;
+    if (!MoneyDeltaRange(chainSupplyDelta)) {
+        return state.DoS(100, error("%s: chain supply delta out of range: %d at height %d", __func__, chainSupplyDelta, pindex->nHeight),
+            REJECT_INVALID, "bad-chain-supply-delta-out-of-range");
+    }
     CAmount transparentValueDelta = 0;
     size_t total_sapling_tx = 0;
     size_t total_orchard_tx = 0;
 
-    std::vector<PrecomputedTransactionData> txdata;
-    txdata.reserve(block.vtx.size()); // Required so that pointers to individual PrecomputedTransactionData don't get invalidated
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         const CTransaction &tx = block.vtx[i];
@@ -3227,7 +3563,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         nInputs += tx.vin.size();
         nSigOps += GetLegacySigOpCount(tx);
         if (nSigOps > MAX_BLOCK_SIGOPS)
-            return state.DoS(100, error("ConnectBlock(): too many sigops"),
+            return state.DoS(100, error("%s: too many sigops", __func__),
                              REJECT_INVALID, "bad-blk-sigops");
 
         // Coinbase transactions are the only case where this vector will not be the same
@@ -3245,13 +3581,34 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         if (!tx.IsCoinBase())
         {
             if (!view.HaveInputs(tx))
-                return state.DoS(100, error("ConnectBlock(): inputs missing/spent"),
+                return state.DoS(100, error("%s: inputs missing/spent", __func__),
                                  REJECT_INVALID, "bad-txns-inputs-missingorspent");
 
             for (const auto& input : tx.vin) {
-                const auto prevout = view.GetOutputFor(input);
+                CTxOut prevout;
+                try {
+                    prevout = view.GetOutputFor(input);
+                } catch (const std::runtime_error& e) {
+                    return state.DoS(100, error("%s: %s", __func__, e.what()),
+                        REJECT_INVALID, "bad-txns-input-value-out-of-range");
+                }
                 transparentValueDelta -= prevout.nValue;
+                if (!MoneyDeltaRange(transparentValueDelta)) {
+                    return state.DoS(100, error("%s: transparent value delta out of range: %d at height %d", __func__, transparentValueDelta, pindex->nHeight),
+                        REJECT_INVALID, "bad-transparent-value-delta-out-of-range");
+                }
                 allPrevOutputs.push_back(prevout);
+            }
+
+            // Which orphan pool entries must we evict?
+            for (size_t j = 0; j < tx.vin.size(); j++) {
+                auto itByPrev = mapOrphanTransactionsByPrev.find(tx.vin[j].prevout);
+                if (itByPrev == mapOrphanTransactionsByPrev.end()) continue;
+                for (auto mi = itByPrev->second.begin(); mi != itByPrev->second.end(); ++mi) {
+                    const CTransaction& orphanTx = (*mi)->second.tx;
+                    const uint256& orphanHash = orphanTx.GetHash();
+                    vOrphanErase.push_back(orphanHash);
+                }
             }
 
             // insightexplorer
@@ -3289,9 +3646,14 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             // Add in sigops done by pay-to-script-hash inputs;
             // this is to prevent a "rogue miner" from creating
             // an incredibly-expensive-to-validate block.
-            nSigOps += GetP2SHSigOpCount(tx, view);
+            try {
+                nSigOps += GetP2SHSigOpCount(tx, view);
+            } catch (const std::runtime_error& e) {
+                return state.DoS(100, error("%s: %s", __func__, e.what()),
+                                 REJECT_INVALID, "bad-txns-input-value-out-of-range");
+            }
             if (nSigOps > MAX_BLOCK_SIGOPS)
-                return state.DoS(100, error("ConnectBlock(): too many sigops"),
+                return state.DoS(100, error("%s: too many sigops", __func__),
                                  REJECT_INVALID, "bad-blk-sigops");
         }
 
@@ -3300,21 +3662,51 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         if (tx.IsCoinBase())
         {
             // Add the output value of the coinbase transaction to the chain supply
-            // delta. This includes fees, which are then canceled out by the fee
-            // subtractions in the other branch of this conditional.
-            chainSupplyDelta += tx.GetValueOut();
+            // delta.
+            // - This includes lockbox disbursement outputs, which are canceled out by
+            //   the subtractions from `nLockboxValue` in `SetChainPoolValues`.
+            // - This includes fees, which are then canceled out by the fee subtractions
+            //   in the other branch of this conditional.
+            try {
+                chainSupplyDelta += tx.GetValueOut();
+            } catch (const std::runtime_error& e) {
+                return state.DoS(100, error("%s: coinbase output value out of range at height %d", __func__, pindex->nHeight),
+                    REJECT_INVALID, "bad-cb-output-value-out-of-range");
+            }
+            if (!MoneyDeltaRange(chainSupplyDelta)) {
+                return state.DoS(100, error("%s: chain supply delta out of range: %d at height %d", __func__, chainSupplyDelta, pindex->nHeight),
+                    REJECT_INVALID, "bad-chain-supply-delta-out-of-range");
+            }
         } else {
-            const auto txFee = view.GetValueIn(tx) - tx.GetValueOut();
+            CAmount txFee;
+            try {
+                txFee = view.GetValueIn(tx) - tx.GetValueOut();
+            } catch (const std::runtime_error& e) {
+                return state.DoS(100, error("%s: tx value out of range at height %d", __func__, pindex->nHeight),
+                    REJECT_INVALID, "bad-txns-value-out-of-range");
+            }
+            if (!MoneyRange(txFee)) {
+                return state.DoS(100, error("%s: transaction fee out of range: %d at height %d", __func__, txFee, pindex->nHeight),
+                    REJECT_INVALID, "bad-txns-fee-out-of-range");
+            }
             nFees += txFee;
+            if (!MoneyRange(nFees)) {
+                return state.DoS(100, error("%s: total fees out of range: %d at height %d", __func__, nFees, pindex->nHeight),
+                    REJECT_INVALID, "bad-txns-total-fees-out-of-range");
+            }
 
             // Fees from a transaction do not go into an output of the transaction,
             // and therefore decrease the chain supply. If the miner claims them,
             // they will be re-added in the other branch of this conditional.
             chainSupplyDelta -= txFee;
+            if (!MoneyDeltaRange(chainSupplyDelta)) {
+                return state.DoS(100, error("%s: chain supply delta out of range: %d at height %d", __func__, chainSupplyDelta, pindex->nHeight),
+                    REJECT_INVALID, "bad-chain-supply-delta-out-of-range");
+            }
 
             std::vector<CScriptCheck> vChecks;
-            if (!ContextualCheckInputs(tx, state, view, fExpensiveChecks, flags, fCacheResults, txdata.back(), chainparams.GetConsensus(), consensusBranchId, nScriptCheckThreads ? &vChecks : NULL))
-                return error("ConnectBlock(): CheckInputs on %s failed with %s",
+            if (!ContextualCheckInputs(tx, state, view, fExpensiveChecks, flags, fCacheResults, txdata.back(), consensusParams, consensusBranchId, nScriptCheckThreads ? &vChecks : NULL))
+                return error("%s: CheckInputs on %s failed with %s", __func__,
                     tx.GetHash().ToString(), FormatStateMessage(state));
             control.Add(vChecks);
         }
@@ -3327,13 +3719,13 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             view,
             saplingAuth,
             orchardAuth,
-            chainparams.GetConsensus(),
+            consensusParams,
             consensusBranchId,
-            chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5),
+            consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5),
             true))
         {
             return error(
-                "ConnectBlock(): ContextualCheckShieldedInputs() on %s failed with %s",
+                "%s: ContextualCheckShieldedInputs() on %s failed with %s", __func__,
                 tx.GetHash().ToString(),
                 FormatStateMessage(state));
         }
@@ -3410,13 +3802,17 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                 }
             } catch (const rust::Error& e) {
                 return state.DoS(100,
-                    error("ConnectBlock(): block would overfill the Orchard commitment tree."),
+                    error("%s: block would overfill the Orchard commitment tree.", __func__),
                     REJECT_INVALID, "orchard-commitment-tree-full");
             }
         }
 
         for (const auto& out : tx.vout) {
             transparentValueDelta += out.nValue;
+            if (!MoneyDeltaRange(transparentValueDelta)) {
+                return state.DoS(100, error("%s: transparent value delta out of range: %d at height %d", __func__, transparentValueDelta, pindex->nHeight),
+                    REJECT_INVALID, "bad-transparent-value-delta-out-of-range");
+            }
         }
 
         if (tx.GetSaplingBundle().IsPresent()) {
@@ -3431,34 +3827,70 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
     }
 
-    // Derive the various block commitments.
-    // We only derive them if they will be used for this block.
-    std::optional<uint256> hashAuthDataRoot;
-    std::optional<uint256> hashChainHistoryRoot;
-    if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
-        hashAuthDataRoot = block.BuildAuthDataMerkleTree();
-    }
-    if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
-        hashChainHistoryRoot = view.GetHistoryRoot(prevConsensusBranchId);
-    }
-
     view.PushAnchor(sprout_tree);
     view.PushAnchor(sapling_tree);
     view.PushAnchor(orchard_tree);
+
+    // Validate the Sapling and Orchard binding signatures here, before the
+    // chain supply consistency check below. The binding signatures are what
+    // enforce that each bundle's value balance is consistent with its
+    // shielded inputs and outputs. If they are not checked first, a block
+    // containing a malformed value balance could reach the supply consistency
+    // check with inconsistent pool accounting, and trigger AbortNode instead
+    // of being cleanly rejected as invalid (GHSA-g4x5-crjh-29ff).
+    //
+    // This must run for both `fJustCheck` and full connection, so it is
+    // placed before the `if (!fJustCheck)` block. The `has_value()` guards
+    // mean that the validators run only when expensive checks are enabled
+    // (`fExpensiveChecks`); they are skipped for block-template checks and
+    // for ancestors of the last checkpoint.
+    if (saplingAuth.has_value() && !saplingAuth.value()->validate()) {
+        return state.DoS(100,
+            error("%s: a Sapling bundle within the block is invalid", __func__),
+            REJECT_INVALID, "bad-sapling-bundle-authorization");
+    }
+    if (orchardAuth.has_value() && !orchardAuth.value()->validate()) {
+        return state.DoS(100,
+            error("%s: an Orchard bundle within the block is invalid", __func__),
+            REJECT_INVALID, "bad-orchard-bundle-authorization");
+    }
+
     if (!fJustCheck) {
         // Update pindex with the net change in value and the chain's total value,
         // both for the supply and for the transparent pool.
+        assert(MoneyDeltaRange(chainSupplyDelta));
+        assert(MoneyDeltaRange(transparentValueDelta));
         pindex->nChainSupplyDelta = chainSupplyDelta;
         pindex->nTransparentValue = transparentValueDelta;
         if (pindex->pprev) {
-            if (pindex->pprev->nChainTotalSupply) {
-                pindex->nChainTotalSupply = *pindex->pprev->nChainTotalSupply + chainSupplyDelta;
+            if (pindex->pprev->nChainTotalSupply.has_value()) {
+                CAmount chainTotalSupply = pindex->pprev->nChainTotalSupply.value();
+                if (!MoneyRange(chainTotalSupply)) {
+                    return state.DoS(100, error("%s: previous total supply out of range: %d at height %d", __func__, chainTotalSupply, pindex->nHeight),
+                        REJECT_INVALID, "bad-chain-total-supply-out-of-range");
+                }
+                chainTotalSupply += chainSupplyDelta;
+                if (!MoneyRange(chainTotalSupply)) {
+                    return state.DoS(100, error("%s: new total supply out of range: %d at height %d", __func__, chainTotalSupply, pindex->nHeight),
+                        REJECT_INVALID, "bad-chain-total-supply-out-of-range");
+                }
+                pindex->nChainTotalSupply = chainTotalSupply;
             } else {
                 pindex->nChainTotalSupply = std::nullopt;
             }
 
-            if (pindex->pprev->nChainTransparentValue) {
-                pindex->nChainTransparentValue = *pindex->pprev->nChainTransparentValue + transparentValueDelta;
+            if (pindex->pprev->nChainTransparentValue.has_value()) {
+                CAmount chainTransparentValue = pindex->pprev->nChainTransparentValue.value();
+                if (!MoneyRange(chainTransparentValue)) {
+                    return state.DoS(100, error("%s: previous chain transparent value out of range: %d at height %d", __func__, chainTransparentValue, pindex->nHeight),
+                        REJECT_INVALID, "bad-chain-transparent-value-out-of-range");
+                }
+                chainTransparentValue += transparentValueDelta;
+                if (!MoneyRange(chainTransparentValue)) {
+                    return state.DoS(100, error("%s: new chain transparent value out of range: %d at height %d", __func__, chainTransparentValue, pindex->nHeight),
+                        REJECT_INVALID, "bad-chain-transparent-value-out-of-range");
+                }
+                pindex->nChainTransparentValue = chainTransparentValue;
             } else {
                 pindex->nChainTransparentValue = std::nullopt;
             }
@@ -3467,15 +3899,69 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             pindex->nChainTransparentValue = transparentValueDelta;
         }
 
+        // Ensure that the total chain supply is consistent with the value in each pool.
+        if (chainparams.ZIP209Enabled()) {
+            // These conditions were checked in the turnstile section above.
+            assert(pindex->nChainSproutValue.has_value());
+            const CAmount sprout_supply = pindex->nChainSproutValue.value();
+            assert(MoneyRange(sprout_supply));
+            assert(MoneyRange(sapling_supply));
+            assert(MoneyRange(orchard_supply));
+            assert(MoneyRange(lockbox_supply));
+
+            // `nChainTotalSupply` and `nChainTransparentValue` may be unpopulated
+            // if a parent block index entry was written by a zcashd version older
+            // than `TRANSPARENT_VALUE_VERSION` and so lacks `nChainSupplyDelta`.
+            // This is normally a "reindex required" condition, but on regtest the
+            // `-regtestallowlegacychainsupplydata` flag allows tests that load such
+            // legacy caches to skip the check instead.
+            if (pindex->nChainTotalSupply.has_value() && pindex->nChainTransparentValue.has_value()) {
+                const CAmount transparent_supply = pindex->nChainTransparentValue.value();
+                const CAmount total_supply       = pindex->nChainTotalSupply.value();
+
+                if (!MoneyRange(transparent_supply)) {
+                    return state.DoS(100,
+                        error("%s: turnstile violation in transparent value pool at height %d (sprout=%d, sapling=%d, orchard=%d, lockbox=%d, transparent=%d, total=%d)", __func__,
+                              pindex->nHeight, sprout_supply, sapling_supply, orchard_supply, lockbox_supply, transparent_supply, total_supply),
+                        REJECT_INVALID, "turnstile-violation-transparent");
+                }
+                if (!MoneyRange(total_supply)) {
+                    return state.DoS(100,
+                        error("%s: turnstile violation in total supply at height %d (sprout=%d, sapling=%d, orchard=%d, lockbox=%d, transparent=%d, total=%d)", __func__,
+                              pindex->nHeight, sprout_supply, sapling_supply, orchard_supply, lockbox_supply, transparent_supply, total_supply),
+                        REJECT_INVALID, "turnstile-violation-total");
+                }
+
+                static_assert(MAX_MONEY <= std::numeric_limits<CAmount>::max() / 5, "sum of five MoneyRange CAmounts must fit in CAmount");
+                const CAmount expected_total_supply = transparent_supply + sprout_supply + sapling_supply + orchard_supply + lockbox_supply;
+                if (expected_total_supply != total_supply) {
+                    return AbortNode(
+                        state,
+                        strprintf("%s: chain total supply does not match sum of pool balances at height %d (sprout=%d, sapling=%d, orchard=%d, lockbox=%d, transparent=%d, total=%d)", __func__,
+                                  pindex->nHeight, sprout_supply, sapling_supply, orchard_supply, lockbox_supply, transparent_supply, total_supply),
+                        _("The chain total supply does not match the sum of the pool balances. This indicates a fatal problem with the node's pool accounting. "
+                          "Please restart zcashd with -reindex."));
+                }
+            } else if (chainparams.RegTestAllowLegacyChainSupplyData()) {
+                LogPrintf("%s: skipping chain supply consistency check at height %d because chain supply tracking fields are missing (-regtestallowlegacychainsupplydata)\n", __func__,
+                          pindex->nHeight);
+            } else if (pindex->nHeight >= chainparams.ChainSupplyCheckpointHeight()) {
+                // The chain supply checkpoint should have injected values at
+                // the checkpoint height. If we're past that height and the
+                // values are still missing, something is wrong.
+                return AbortNode(state, "Chain supply tracking fields are missing; please restart with -reindex to recover.");
+            }
+        }
+
         pindex->hashFinalSproutRoot = sprout_tree.root();
         // - If this block is before Heartwood activation, then we don't set
         //   hashFinalSaplingRoot here to maintain the invariant documented in
         //   CBlockIndex (which was ensured in AddToBlockIndex).
         // - If this block is on or after Heartwood activation, this is where we
         //   set the correct value of hashFinalSaplingRoot; in particular,
-        //   blocks that are never passed to ConnectBlock() (and thus never on
+        //   blocks that are never passed to ConnectBlock (and thus never on
         //   the main chain) will stay with hashFinalSaplingRoot set to null.
-        if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
+        if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
             pindex->hashFinalSaplingRoot = sapling_tree.root();
         }
 
@@ -3486,39 +3972,30 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         // - If this block is on or after NU5 activation, this is where we set
         //   the correct values of hashAuthDataRoot, hashFinalOrchardRoot, and
         //   hashChainHistoryRoot; in particular, blocks that are never passed
-        //   to ConnectBlock() (and thus never on the main chain) will stay with
+        //   to ConnectBlock (and thus never on the main chain) will stay with
         //   these set to null.
-        if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
+        if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
+            assert(hashAuthDataRoot.has_value());
+            assert(hashChainHistoryRoot.has_value());
             pindex->hashAuthDataRoot = hashAuthDataRoot.value();
-            pindex->hashFinalOrchardRoot = orchard_tree.root(),
+            pindex->hashFinalOrchardRoot = orchard_tree.root();
             pindex->hashChainHistoryRoot = hashChainHistoryRoot.value();
         }
     }
     blockundo.old_sprout_tree_root = old_sprout_tree_root;
 
-    if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
-        if (fCheckAuthDataRoot) {
-            // If NU5 is active, block.hashBlockCommitments must be the top digest
-            // of the ZIP 244 block commitments linked list.
-            // https://zips.z.cash/zip-0244#block-header-changes
-            uint256 hashBlockCommitments = DeriveBlockCommitmentsHash(
-                hashChainHistoryRoot.value(),
-                hashAuthDataRoot.value());
-            if (block.hashBlockCommitments != hashBlockCommitments) {
-                return state.DoS(100,
-                    error("ConnectBlock(): block's hashBlockCommitments is incorrect (should be ZIP 244 block commitment)"),
-                    REJECT_INVALID, "bad-block-commitments-hash");
-            }
-        }
-    } else if (IsActivationHeight(pindex->nHeight, chainparams.GetConsensus(), Consensus::UPGRADE_HEARTWOOD)) {
+    if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
+        // NU5+ hashBlockCommitments was checked earlier in ConnectBlock,
+        // before per-tx verification.
+    } else if (IsActivationHeight(pindex->nHeight, consensusParams, Consensus::UPGRADE_HEARTWOOD)) {
         // In the block that activates ZIP 221, block.hashBlockCommitments MUST
         // be set to all zero bytes.
         if (!block.hashBlockCommitments.IsNull()) {
             return state.DoS(100,
-                error("ConnectBlock(): block's hashBlockCommitments is incorrect (should be null)"),
+                error("%s: block's hashBlockCommitments is incorrect (should be null)", __func__),
                 REJECT_INVALID, "bad-heartwood-root-in-block");
         }
-    } else if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
+    } else if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
         // If Heartwood is active, block.hashBlockCommitments must be the same as
         // the root of the history tree for the previous block. We only store
         // one tree per epoch, so we have two possible cases:
@@ -3527,25 +4004,26 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         // - If the previous block is in this epoch, this block would affect
         //   this epoch's tree root, but as we haven't updated the tree for this
         //   block yet, view.GetHistoryRoot() returns the root we need.
+        assert(hashChainHistoryRoot.has_value());
         if (block.hashBlockCommitments != hashChainHistoryRoot.value()) {
             return state.DoS(100,
-                error("ConnectBlock(): block's hashBlockCommitments is incorrect (should be history tree root)"),
+                error("%s: block's hashBlockCommitments is incorrect (should be history tree root)", __func__),
                 REJECT_INVALID, "bad-heartwood-root-in-block");
         }
-    } else if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_SAPLING)) {
+    } else if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_SAPLING)) {
         // If Sapling is active, block.hashBlockCommitments must be the
         // same as the root of the Sapling tree
         if (block.hashBlockCommitments != sapling_tree.root()) {
             return state.DoS(100,
-                error("ConnectBlock(): block's hashBlockCommitments is incorrect (should be Sapling tree root)"),
+                error("%s: block's hashBlockCommitments is incorrect (should be Sapling tree root)", __func__),
                 REJECT_INVALID, "bad-sapling-root-in-block");
         }
     }
 
     // History read/write is started with Heartwood update.
-    if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
+    if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_HEARTWOOD)) {
         HistoryNode historyNode;
-        if (chainparams.GetConsensus().NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
+        if (consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU5)) {
             historyNode = libzcash::NewV2Leaf(
                 block.GetHash(),
                 block.nTime,
@@ -3575,46 +4053,43 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     int64_t nTime1 = GetTimeMicros(); nTimeConnect += nTime1 - nTimeStart;
     LogPrint("bench", "      - Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin) [%.2fs]\n", (unsigned)block.vtx.size(), 0.001 * (nTime1 - nTimeStart), 0.001 * (nTime1 - nTimeStart) / block.vtx.size(), nInputs <= 1 ? 0 : 0.001 * (nTime1 - nTimeStart) / (nInputs-1), nTimeConnect * 0.000001);
 
-    CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, chainparams.GetConsensus());
-    if (block.vtx[0].GetValueOut() > blockReward)
+    CAmount cbTotalOutputValue;
+    try {
+        cbTotalOutputValue = block.vtx[0].GetValueOut();
+    } catch (const std::runtime_error& e) {
+        return state.DoS(100, error("%s: coinbase output value out of range at height %d", __func__, pindex->nHeight),
+            REJECT_INVALID, "bad-cb-output-value-out-of-range");
+    }
+    cbTotalOutputValue += pindex->nLockboxValue;
+    if (!MoneyRange(cbTotalOutputValue)) {
+        return state.DoS(100, error("%s: coinbase output value out of range at height %d", __func__, pindex->nHeight),
+            REJECT_INVALID, "bad-cb-output-value-out-of-range");
+    }
+    CAmount cbTotalInputValue = consensusParams.GetBlockSubsidy(pindex->nHeight) + nFees;
+    if (!MoneyRange(cbTotalInputValue)) {
+        return state.DoS(100, error("%s: coinbase input value out of range at height %d", __func__, pindex->nHeight),
+            REJECT_INVALID, "bad-cb-input-value-out-of-range");
+    }
+    if (cbTotalOutputValue > cbTotalInputValue) {
         return state.DoS(100,
-                         error("ConnectBlock(): coinbase pays too much (actual=%d vs limit=%d)",
-                               block.vtx[0].GetValueOut(), blockReward),
-                               REJECT_INVALID, "bad-cb-amount");
-
-    // Ensure that the total chain supply is consistent with the value in each pool.
-    if (!fJustCheck &&
-            pindex->nChainTotalSupply.has_value() &&
-            pindex->nChainTransparentValue.has_value() &&
-            pindex->nChainSproutValue.has_value() &&
-            pindex->nChainSaplingValue.has_value() &&
-            pindex->nChainOrchardValue.has_value())
-    {
-        auto expectedChainSupply =
-            pindex->nChainTransparentValue.value() +
-            pindex->nChainSproutValue.value() +
-            pindex->nChainSaplingValue.value() +
-            pindex->nChainOrchardValue.value();
-        if (expectedChainSupply != pindex->nChainTotalSupply.value()) {
-            // This may be added as a rule to ZIP 209 and return a failure in a future soft-fork.
-            error("ConnectBlock(): chain total supply (%d) does not match sum of pool balances (%d) at height %d",
-                    pindex->nChainTotalSupply.value(), expectedChainSupply, pindex->nHeight);
-        }
+            error("%s: coinbase pays too much (actual=%d vs limit=%d)", __func__,
+                cbTotalOutputValue - pindex->nLockboxValue, cbTotalInputValue - pindex->nLockboxValue),
+                REJECT_INVALID, "bad-cb-amount");
+    } else if (
+        consensusParams.NetworkUpgradeActive(pindex->nHeight, Consensus::UPGRADE_NU6) &&
+        cbTotalOutputValue != cbTotalInputValue
+    ) {
+        return state.DoS(100,
+            error(
+                "%s: coinbase pays the wrong amount (actual=%d vs expected=%d; lockbox value is %d)", __func__,
+                cbTotalOutputValue - pindex->nLockboxValue,
+                cbTotalInputValue - pindex->nLockboxValue,
+                pindex->nLockboxValue),
+            REJECT_INVALID, "bad-cb-not-exact");
     }
 
-    // Ensure Sapling authorizations are valid (if we are checking them)
-    if (saplingAuth.has_value() && !saplingAuth.value()->validate()) {
-        return state.DoS(100,
-            error("ConnectBlock(): a Sapling bundle within the block is invalid"),
-            REJECT_INVALID, "bad-sapling-bundle-authorization");
-    }
-
-    // Ensure Orchard signatures are valid (if we are checking them)
-    if (orchardAuth.has_value() && !orchardAuth.value()->validate()) {
-        return state.DoS(100,
-            error("ConnectBlock(): an Orchard bundle within the block is invalid"),
-            REJECT_INVALID, "bad-orchard-bundle-authorization");
-    }
+    // (The Sapling and Orchard bundle authorizations are validated earlier,
+    // before the chain supply consistency check; see GHSA-g4x5-crjh-29ff.)
 
     if (!control.Wait())
         return state.DoS(100, false);
@@ -3625,12 +4100,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         return true;
 
     // Write undo information to disk
-    if (pindex->GetUndoPos().IsNull() || !pindex->IsValid(BLOCK_VALID_SCRIPTS))
+    if (pindex->GetUndoPos().IsNull() || !pindex->IsValid(BLOCK_VALID_CONSENSUS))
     {
         if (pindex->GetUndoPos().IsNull()) {
             CDiskBlockPos _pos;
             if (!FindUndoPos(state, pindex->nFile, _pos, ::GetSerializeSize(blockundo, SER_DISK, CLIENT_VERSION) + 40))
-                return error("ConnectBlock(): FindUndoPos failed");
+                return error("%s: FindUndoPos failed", __func__);
             if (!UndoWriteToDisk(blockundo, _pos, pindex->pprev->GetBlockHash(), chainparams.MessageStart()))
                 return AbortNode(state, "Failed to write undo data");
 
@@ -3639,18 +4114,16 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
             pindex->nStatus |= BLOCK_HAVE_UNDO;
         }
 
-        // Now that all consensus rules have been validated, set nCachedBranchId.
-        // Move this if BLOCK_VALID_CONSENSUS is ever altered.
-        static_assert(BLOCK_VALID_CONSENSUS == BLOCK_VALID_SCRIPTS,
-            "nCachedBranchId must be set after all consensus rules have been validated.");
-        if (IsActivationHeightForAnyUpgrade(pindex->nHeight, chainparams.GetConsensus())) {
+        // Now that all consensus rules have been validated, set nCachedBranchId
+        // and raise validity to BLOCK_VALID_CONSENSUS.
+        if (IsActivationHeightForAnyUpgrade(pindex->nHeight, consensusParams)) {
             pindex->nStatus |= BLOCK_ACTIVATES_UPGRADE;
-            pindex->nCachedBranchId = CurrentEpochBranchId(pindex->nHeight, chainparams.GetConsensus());
+            pindex->nCachedBranchId = CurrentEpochBranchId(pindex->nHeight, consensusParams);
         } else if (pindex->pprev) {
             pindex->nCachedBranchId = pindex->pprev->nCachedBranchId;
         }
 
-        pindex->RaiseValidity(BLOCK_VALID_SCRIPTS);
+        pindex->RaiseValidity(BLOCK_VALID_CONSENSUS);
         setDirtyBlockIndex.insert(pindex);
     }
 
@@ -3699,6 +4172,15 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     int64_t nTime3 = GetTimeMicros(); nTimeIndex += nTime3 - nTime2;
     LogPrint("bench", "    - Index writing: %.2fms [%.2fs]\n", 0.001 * (nTime3 - nTime2), nTimeIndex * 0.000001);
+
+    // Erase orphan transactions include or precluded by this block
+    if (vOrphanErase.size()) {
+        int nErased = 0;
+        for (uint256 &orphanHash : vOrphanErase) {
+            nErased += EraseOrphanTx(orphanHash);
+        }
+        LogPrint("mempool", "Erased %d orphan tx included or conflicted by block\n", nErased);
+    }
 
     return true;
 }
@@ -4094,6 +4576,15 @@ bool static ConnectTip(CValidationState& state, const CChainParams& chainparams,
         uiInterface.NotifyTxExpiration(id);
     }
 
+    // If we've just connected the last block before the soft fork, clear the mempool of
+    // transactions containing Orchard actions. We only need to do this at the soft fork
+    // boundary; blocks are always connected sequentially in zcashd while holding
+    // `cs_main`, and after that point AcceptToMemoryPool rejects Orchard-containing
+    // transactions via ContextualCheckTransaction.
+    if (chainparams.GetConsensus().nTemporaryOrchardDisablingSoftForkHeight == pindexNew->nHeight + 1) {
+        mempool.removeContainingOrchard();
+    }
+
     // Update chainActive & related variables.
     UpdateTip(pindexNew, chainparams);
 
@@ -4466,7 +4957,7 @@ bool InvalidateBlock(CValidationState& state, const CChainParams& chainparams, C
     // add it again.
     BlockMap::iterator it = mapBlockIndex.begin();
     while (it != mapBlockIndex.end()) {
-        if (it->second->IsValid(BLOCK_VALID_TRANSACTIONS) && it->second->nChainTx && !setBlockIndexCandidates.value_comp()(it->second, chainActive.Tip())) {
+        if (it->second->IsValid(BLOCK_PARTIALLY_VALID_TRANSACTIONS) && it->second->nChainTx && !setBlockIndexCandidates.value_comp()(it->second, chainActive.Tip())) {
             setBlockIndexCandidates.insert(it->second);
         }
         it++;
@@ -4490,7 +4981,7 @@ bool ReconsiderBlock(CValidationState& state, CBlockIndex *pindex) {
         if (!it->second->IsValid() && it->second->GetAncestor(nHeight) == pindex) {
             it->second->nStatus &= ~BLOCK_FAILED_MASK;
             setDirtyBlockIndex.insert(it->second);
-            if (it->second->IsValid(BLOCK_VALID_TRANSACTIONS) && it->second->nChainTx && setBlockIndexCandidates.value_comp()(chainActive.Tip(), it->second)) {
+            if (it->second->IsValid(BLOCK_PARTIALLY_VALID_TRANSACTIONS) && it->second->nChainTx && setBlockIndexCandidates.value_comp()(chainActive.Tip(), it->second)) {
                 setBlockIndexCandidates.insert(it->second);
             }
             if (it->second == pindexBestInvalid) {
@@ -4569,10 +5060,7 @@ CBlockIndex* AddToBlockIndex(const CBlockHeader& block, const Consensus::Params&
     return pindexNew;
 }
 
-void FallbackSproutValuePoolBalance(
-    CBlockIndex *pindex,
-    const CChainParams& chainparams
-)
+void FallbackSproutValuePoolBalance(CBlockIndex *pindex, const CChainParams& chainparams)
 {
     if (!chainparams.ZIP209Enabled()) {
         return;
@@ -4587,17 +5075,17 @@ void FallbackSproutValuePoolBalance(
     if (pindex->nHeight == chainparams.SproutValuePoolCheckpointHeight()) {
         if (pindex->GetBlockHash() == chainparams.SproutValuePoolCheckpointBlockHash()) {
             // Are we monitoring the Sprout pool?
-            if (!pindex->nChainSproutValue) {
+            if (!pindex->nChainSproutValue.has_value()) {
                 // Apparently not. Introduce the hardcoded value so we monitor for
                 // this point onwards (assuming the checkpoint is late enough)
                 pindex->nChainSproutValue = chainparams.SproutValuePoolCheckpointBalance();
             } else {
                 // Apparently we have been. So, we should expect the current
                 // value to match the hardcoded one.
-                assert(*pindex->nChainSproutValue == chainparams.SproutValuePoolCheckpointBalance());
-                // And we should expect non-none for the delta stored in the block index here,
+                assert(pindex->nChainSproutValue.value() == chainparams.SproutValuePoolCheckpointBalance());
+                // And we should expect non-nullopt for the delta stored in the block index here,
                 // or the checkpoint is too early.
-                assert(pindex->nSproutValue != std::nullopt);
+                assert(pindex->nSproutValue.has_value());
             }
         } else {
             LogPrintf(
@@ -4608,7 +5096,379 @@ void FallbackSproutValuePoolBalance(
     }
 }
 
-/** Mark a block as having its data received and checked (up to BLOCK_VALID_TRANSACTIONS). */
+static bool CheckBlockMerkleRoot(const CBlock& block, bool* mutated);
+
+// Compute per-block pool value deltas from a block's transactions and
+// consensus rules. Used by both SetChainPoolValues (when a new block is
+// received) and CheckRecomputedPoolDeltas (when verifying persisted
+// deltas on load).
+//
+// `corruptionHint` is appended to any range-error message, and should be
+// either "" (for newly-received blocks where an overflow implies a bug or
+// malformed block) or a hint telling the user to reindex (for the on-load
+// path where an overflow implies persisted-data corruption).
+//
+// On success, sets sproutValue, saplingValue, orchardValue, and lockboxValue
+// to the corresponding per-block deltas, and returns true. Returns false if
+// any running sum goes out of MoneyDeltaRange.
+static bool ComputePoolDeltas(
+    const CBlock& block,
+    const CChainParams& chainparams,
+    int nHeight,
+    const char* corruptionHint,
+    CAmount& sproutValue,
+    CAmount& saplingValue,
+    CAmount& orchardValue,
+    CAmount& lockboxValue)
+{
+    sproutValue = 0;
+    saplingValue = 0;
+    orchardValue = 0;
+
+    // Each lockbox disbursement produces a negative change to the lockbox value.
+    // Each lockbox funding stream produces a positive change to the lockbox value.
+    lockboxValue = 0;
+    for (auto disbursement : chainparams.GetConsensus().GetLockboxDisbursementsForHeight(nHeight)) {
+        lockboxValue -= disbursement.GetAmount();
+        if (!MoneyDeltaRange(lockboxValue)) {
+            return error("%s: lockbox value delta out of range: %d at height %d.%s", __func__,
+                lockboxValue, nHeight, corruptionHint);
+        }
+    }
+    for (auto elem : chainparams.GetConsensus().GetActiveFundingStreamElements(nHeight)) {
+        if (std::holds_alternative<Consensus::Lockbox>(elem.first)) {
+            lockboxValue += elem.second;
+            if (!MoneyDeltaRange(lockboxValue)) {
+                return error("%s: lockbox value delta out of range: %d at height %d.%s", __func__,
+                    lockboxValue, nHeight, corruptionHint);
+            }
+        }
+    }
+
+    for (const auto& tx : block.vtx) {
+        // Negative valueBalanceSapling "takes" money from the transparent value pool
+        // and adds it to the Sapling value pool. Positive valueBalanceSapling "gives"
+        // money to the transparent value pool, removing from the Sapling value
+        // pool. So we invert the sign here.
+        saplingValue -= tx.GetValueBalanceSapling();
+        if (!MoneyDeltaRange(saplingValue)) {
+            return error("%s: sapling value delta out of range: %d at height %d.%s", __func__,
+                saplingValue, nHeight, corruptionHint);
+        }
+
+        // valueBalanceOrchard behaves the same way as valueBalanceSapling.
+        orchardValue -= tx.GetOrchardBundle().GetValueBalance();
+        if (!MoneyDeltaRange(orchardValue)) {
+            return error("%s: orchard value delta out of range: %d at height %d.%s", __func__,
+                orchardValue, nHeight, corruptionHint);
+        }
+
+        for (const auto& js : tx.vJoinSplit) {
+            sproutValue += js.vpub_old;
+            if (!MoneyDeltaRange(sproutValue)) {
+                return error("%s: sprout value delta out of range: %d at height %d.%s", __func__,
+                    sproutValue, nHeight, corruptionHint);
+            }
+            sproutValue -= js.vpub_new;
+            if (!MoneyDeltaRange(sproutValue)) {
+                return error("%s: sprout value delta out of range: %d at height %d.%s", __func__,
+                    sproutValue, nHeight, corruptionHint);
+            }
+        }
+    }
+
+    return true;
+}
+
+// Recompute shielded pool per-block deltas from the actual block data on
+// disk, returning false if they are inconsistent with the persisted values
+// on `pindex`. This is used during LoadBlockIndexDB for blocks at or after
+// the chain supply checkpoint to ensure that corrupted persisted deltas
+// cannot propagate wrong chain values.
+//
+// The Merkle root is verified against the header (which has already been
+// validated by PoW) to ensure the transactions have not been tampered with
+// on disk. Proofs are NOT re-verified — only pool deltas are recomputed.
+//
+// If fHavePruned is set (indicating intentional pruning), tolerate the
+// block data being missing.
+//
+// Returns false on error or if an inconsistency is detected.
+static bool CheckRecomputedPoolDeltas(const CBlockIndex* pindex, const CChainParams& chainparams, bool fHavePruned)
+{
+    CBlock block;
+    if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus())) {
+        if (fHavePruned) {
+            // We cannot check the pool deltas but this is likely because of
+            // intentional pruning. Just trust the persisted deltas in this case.
+            return true;
+        } else {
+            return error("%s: failed to read block at height %d from disk. "
+                "This may indicate on-disk corruption; please restart with -reindex.", __func__,
+                pindex->nHeight);
+        }
+    }
+
+    // Verify that the transactions match the header's Merkle root.
+    bool mutated = false;
+    if (!CheckBlockMerkleRoot(block, &mutated)) {
+        return error("%s: Merkle root check failed at height %d (mutated=%s). "
+            "This may indicate on-disk corruption; please restart with -reindex.", __func__,
+            pindex->nHeight, mutated ? "true" : "false");
+    }
+
+    // Recompute pool deltas from the block data. If an overflow is detected
+    // here, it indicates persisted-deltas corruption (since the same block
+    // was accepted at tip previously), so hint at reindexing.
+    CAmount sproutValue, saplingValue, orchardValue, lockboxValue;
+    if (!ComputePoolDeltas(block, chainparams, pindex->nHeight,
+                           " This may indicate on-disk corruption; please restart with -reindex.",
+                           sproutValue, saplingValue, orchardValue, lockboxValue)) {
+        return false;
+    }
+
+    // Abort if (non-nullopt) persisted differs from recomputed, since that indicates corruption.
+    auto checkDelta = [&](const char* name, CAmount persisted, CAmount recomputed) -> bool {
+        if (persisted != recomputed) {
+            return error("%s: %s mismatch at height %d: persisted %d, recomputed %d. "
+                "This may indicate on-disk corruption; please restart with -reindex.", __func__,
+                name, pindex->nHeight, persisted, recomputed);
+        }
+        return true;
+    };
+
+    // Check recomputed deltas against persisted values.
+    //
+    // nSproutValue may be nullopt on legacy block indexes written before SPROUT_VALUE_VERSION,
+    // but this should not occur at heights >= the chain supply checkpoint.
+    if (!pindex->nSproutValue.has_value()) {
+        return error("%s: Sprout value is nullopt at height %d, which should not occur "
+            "after the chain supply checkpoint at height %d. "
+            "This may indicate on-disk corruption; please restart with -reindex.", __func__,
+            pindex->nHeight, chainparams.ChainSupplyCheckpointHeight());
+    }
+    return checkDelta("nSproutValue", pindex->nSproutValue.value(), sproutValue)
+        && checkDelta("nSaplingValue", pindex->nSaplingValue, saplingValue)
+        && checkDelta("nOrchardValue", pindex->nOrchardValue, orchardValue)
+        && checkDelta("nLockboxValue", pindex->nLockboxValue, lockboxValue);
+}
+
+bool FallbackChainSupplyCheckpoint(CBlockIndex *pindex, const CChainParams& chainparams)
+{
+    // Check if the height of this block matches the chain supply checkpoint
+    if (pindex->nHeight != chainparams.ChainSupplyCheckpointHeight()) {
+        return true;
+    }
+
+    if (!chainparams.ChainSupplyCheckpointBlockHash().IsNull() &&
+        pindex->GetBlockHash() != chainparams.ChainSupplyCheckpointBlockHash()) {
+        return error("%s: checkpoint block hash mismatch at height %d: "
+            "expected %s, got %s",
+            __func__, pindex->nHeight,
+            chainparams.ChainSupplyCheckpointBlockHash().ToString(),
+            pindex->GetBlockHash().ToString());
+    }
+
+    // Verify that the checkpoint pool values sum to the total supply.
+    assert(chainparams.ChainSupplyCheckpointTransparentValue()
+         + chainparams.ChainSupplyCheckpointSproutValue()
+         + chainparams.ChainSupplyCheckpointSaplingValue()
+         + chainparams.ChainSupplyCheckpointOrchardValue()
+         + chainparams.ChainSupplyCheckpointLockboxValue()
+        == chainparams.ChainSupplyCheckpointTotalSupply());
+
+    // Helper: inject a checkpoint value if nullopt, or error if it mismatches.
+    auto applyCheckpoint = [&](const char* fieldName,
+                               std::optional<CAmount>& field,
+                               CAmount expected) -> bool {
+        if (!field.has_value()) {
+            field = expected;
+        } else if (field.value() != expected) {
+            return error("%s: %s mismatch at checkpoint height %d: "
+                "expected %d, got %d. This may indicate chain value corruption; "
+                "please restart with -reindex.",
+                __func__, fieldName, pindex->nHeight,
+                expected, field.value());
+        }
+        return true;
+    };
+
+    return applyCheckpoint("nChainTotalSupply",
+                           pindex->nChainTotalSupply,
+                           chainparams.ChainSupplyCheckpointTotalSupply())
+        && applyCheckpoint("nChainTransparentValue",
+                           pindex->nChainTransparentValue,
+                           chainparams.ChainSupplyCheckpointTransparentValue())
+        && applyCheckpoint("nChainSproutValue",
+                           pindex->nChainSproutValue,
+                           chainparams.ChainSupplyCheckpointSproutValue())
+        && applyCheckpoint("nChainSaplingValue",
+                           pindex->nChainSaplingValue,
+                           chainparams.ChainSupplyCheckpointSaplingValue())
+        && applyCheckpoint("nChainOrchardValue",
+                           pindex->nChainOrchardValue,
+                           chainparams.ChainSupplyCheckpointOrchardValue())
+        && applyCheckpoint("nChainLockboxValue",
+                           pindex->nChainLockboxValue,
+                           chainparams.ChainSupplyCheckpointLockboxValue());
+}
+
+// Set `nChain<pool>Value` fields on `pindex` for Sprout, Sapling, Orchard, and
+// Lockbox pools by accumulating the per-block deltas into the parent's chain
+// totals. The per-block delta fields (`nSproutValue`, `nSaplingValue`,
+// `nOrchardValue`, `nLockboxValue`) must already be populated on `pindex`.
+//
+// For the genesis block (`pprev == nullptr`), the chain values are set equal
+// to the per-block deltas. We assert `nHeight == 0` to catch the mis-use where
+// a non-genesis block with a null `pprev` would otherwise be silently treated
+// as genesis, corrupting chain value accumulation for all descendants.
+//
+// For non-genesis blocks, chain values are set to `*pprev->nChain<pool>Value +
+// pindex-><per-block>Value` when `pprev` has the corresponding chain value
+// populated, and to `std::nullopt` otherwise. For Sprout, `nSproutValue` itself
+// may be `std::nullopt` on legacy block indexes written by client versions
+// older than SPROUT_VALUE_VERSION; in that case the child's `nChainSproutValue`
+// is also `std::nullopt`.
+//
+// This does NOT touch `nChainTotalSupply` or `nChainTransparentValue`; those
+// require a coins view and are set in `ConnectBlock`.
+static bool AccumulateChainPoolValues(CBlockIndex *pindex)
+{
+    if (pindex->pprev == nullptr) {
+        // Only the genesis block has a null parent. A non-genesis block with
+        // `pprev == nullptr` would silently corrupt chain value accumulation
+        // by setting chain values equal to the per-block deltas instead of
+        // accumulating from the parent.
+        assert(pindex->nHeight == 0);
+        pindex->nChainSproutValue = pindex->nSproutValue;
+        pindex->nChainSaplingValue = pindex->nSaplingValue;
+        pindex->nChainOrchardValue = pindex->nOrchardValue;
+        pindex->nChainLockboxValue = pindex->nLockboxValue;
+        return true;
+    }
+
+    // Pre-addition range checks to prevent signed integer overflow (UB).
+    // On-disk per-block deltas could be corrupted, so we cannot assume
+    // they are in range.
+
+    // Sprout: both the parent chain value and the per-block delta must be
+    // populated. The per-block delta may be missing on legacy block indexes.
+    if (pindex->pprev->nChainSproutValue.has_value() && pindex->nSproutValue.has_value()) {
+        CAmount chainSproutValue = pindex->pprev->nChainSproutValue.value();
+        if (!MoneyRange(chainSproutValue) || !MoneyDeltaRange(pindex->nSproutValue.value())) {
+            return error("%s: sprout pool value out of range at height %d", __func__, pindex->nHeight);
+        }
+        pindex->nChainSproutValue = chainSproutValue + pindex->nSproutValue.value();
+    } else {
+        pindex->nChainSproutValue = std::nullopt;
+    }
+
+    // Sapling
+    if (pindex->pprev->nChainSaplingValue.has_value()) {
+        CAmount chainSaplingValue = pindex->pprev->nChainSaplingValue.value();
+        if (!MoneyRange(chainSaplingValue) || !MoneyDeltaRange(pindex->nSaplingValue)) {
+            return error("%s: sapling pool value out of range at height %d", __func__, pindex->nHeight);
+        }
+        pindex->nChainSaplingValue = chainSaplingValue + pindex->nSaplingValue;
+    } else {
+        pindex->nChainSaplingValue = std::nullopt;
+    }
+
+    // Orchard
+    if (pindex->pprev->nChainOrchardValue.has_value()) {
+        CAmount chainOrchardValue = pindex->pprev->nChainOrchardValue.value();
+        if (!MoneyRange(chainOrchardValue) || !MoneyDeltaRange(pindex->nOrchardValue)) {
+            return error("%s: orchard pool value out of range at height %d", __func__, pindex->nHeight);
+        }
+        pindex->nChainOrchardValue = chainOrchardValue + pindex->nOrchardValue;
+    } else {
+        pindex->nChainOrchardValue = std::nullopt;
+    }
+
+    // Lockbox
+    if (pindex->pprev->nChainLockboxValue.has_value()) {
+        CAmount chainLockboxValue = pindex->pprev->nChainLockboxValue.value();
+        if (!MoneyRange(chainLockboxValue) || !MoneyDeltaRange(pindex->nLockboxValue)) {
+            return error("%s: lockbox pool value out of range at height %d", __func__, pindex->nHeight);
+        }
+        pindex->nChainLockboxValue = chainLockboxValue + pindex->nLockboxValue;
+    } else {
+        pindex->nChainLockboxValue = std::nullopt;
+    }
+
+    return true;
+}
+
+// Compute the effect of `block` on the chain supply and the value in each value pool.
+// This requires `pindex->nHeight` and `pindex->pprev` to be set, but nothing else.
+//
+// Returns false if the block's aggregate per-pool value deltas overflow the
+// valid monetary range at any step of the accumulation.
+bool SetChainPoolValues(
+    const CChainParams& chainparams,
+    const CBlock &block,
+    CBlockIndex *pindex)
+{
+    // pindex->pprev is only permitted to be null for the genesis block
+    assert (pindex->pprev || pindex->nHeight == 0);
+
+    CAmount sproutValue, saplingValue, orchardValue, lockboxValue;
+    if (!ComputePoolDeltas(block, chainparams, pindex->nHeight, "",
+                           sproutValue, saplingValue, orchardValue, lockboxValue)) {
+        return false;
+    }
+    LogPrint("valuepool", "%s: Lockbox value is %d at height %d", __func__, lockboxValue, pindex->nHeight);
+
+    // These values can only be computed here for the genesis block.
+    // For all other blocks, we update them in ConnectBlock instead.
+    if (pindex->pprev == nullptr) {
+        CAmount chainSupplyDelta = 0;
+        CAmount transparentValueDelta = 0;
+        for (const auto& tx : block.vtx) {
+            try {
+                chainSupplyDelta = tx.GetValueOut();
+            } catch (const std::runtime_error& e) {
+                return error("%s: genesis coinbase output value out of range", __func__);
+            }
+            for (const auto& out : tx.vout) {
+                transparentValueDelta += out.nValue;
+            }
+        }
+        pindex->nChainSupplyDelta = chainSupplyDelta;
+        pindex->nTransparentValue = transparentValueDelta;
+    } else {
+        pindex->nChainSupplyDelta = std::nullopt;
+        pindex->nTransparentValue = std::nullopt;
+    }
+
+    pindex->nChainTotalSupply = std::nullopt;
+    pindex->nChainTransparentValue = std::nullopt;
+
+    pindex->nSproutValue = sproutValue;
+    pindex->nSaplingValue = saplingValue;
+    pindex->nOrchardValue = orchardValue;
+    pindex->nLockboxValue = lockboxValue;
+    pindex->nChainLockboxValue = std::nullopt;
+
+    // Accumulate per-pool chain values from pprev. This makes chain values
+    // available to ConnectBlock in the TestNewBlockAtTipValidity path, where
+    // ReceivedBlockTransactions is not called.
+    if (!AccumulateChainPoolValues(pindex)) {
+        return false;
+    }
+
+    // Fall back to hardcoded Sprout value pool balance when a checkpoint
+    // height is crossed (relevant for legacy block indexes where nSproutValue
+    // may be missing).
+    FallbackSproutValuePoolBalance(pindex, chainparams);
+
+    return true;
+}
+
+/**
+ * Mark a block as having its data received and checked (up to BLOCK_PARTIALLY_VALID_TRANSACTIONS).
+ * The caller is expected to mark `pindexNew` as dirty by adding it to `setDirtyBlockIndex`.
+ */
 bool ReceivedBlockTransactions(
     const CBlock &block,
     CValidationState& state,
@@ -4616,70 +5476,33 @@ bool ReceivedBlockTransactions(
     CBlockIndex *pindexNew,
     const CDiskBlockPos& pos)
 {
+    // Compute per-block pool value deltas first. `SetChainPoolValues` can
+    // fail if the running sum of per-pool values overflows the valid
+    // monetary range. On failure `pindexNew` is left in its prior
+    // (header-only) state and the sending peer is banned (see below).
+    if (!SetChainPoolValues(chainparams, block, pindexNew)) {
+        // The aggregate pool-value delta is outside the valid monetary range.
+        // This is a deterministic property of the block (ComputePoolDeltas reads
+        // only `block`, `chainparams`, and `nHeight`), so every honest node
+        // rejects the same block and the sending peer can safely be banned.
+        // The DoS score is what bounds the otherwise-unbounded re-write replay
+        // (GHSA-78pp-mc9g-g4mw).
+        return state.DoS(100,
+            error("ReceivedBlockTransactions(): SetChainPoolValues failed"),
+            REJECT_INVALID, "bad-blk-pool-value-out-of-range");
+    }
+
     pindexNew->nTx = block.vtx.size();
     pindexNew->nChainTx = 0;
-
-    // the following values are computed here only for the genesis block
-    CAmount chainSupplyDelta = 0;
-    CAmount transparentValueDelta = 0;
-
-    CAmount sproutValue = 0;
-    CAmount saplingValue = 0;
-    CAmount orchardValue = 0;
-    for (auto tx : block.vtx) {
-        // For the genesis block only, compute the chain supply delta and the transparent
-        // output total.
-        if (pindexNew->pprev == nullptr) {
-            chainSupplyDelta = tx.GetValueOut();
-            for (const auto& out : tx.vout) {
-                transparentValueDelta += out.nValue;
-            }
-        }
-
-        // Negative valueBalanceSapling "takes" money from the transparent value pool
-        // and adds it to the Sapling value pool. Positive valueBalanceSapling "gives"
-        // money to the transparent value pool, removing from the Sapling value
-        // pool. So we invert the sign here.
-        saplingValue += -tx.GetValueBalanceSapling();
-
-        // valueBalanceOrchard behaves the same way as valueBalanceSapling.
-        orchardValue += -tx.GetOrchardBundle().GetValueBalance();
-
-        for (auto js : tx.vJoinSplit) {
-            sproutValue += js.vpub_old;
-            sproutValue -= js.vpub_new;
-        }
-    }
-
-    // These values can only be computed here for the genesis block.
-    // For all other blocks, we update them in ConnectBlock instead.
-    if (pindexNew->pprev == nullptr) {
-        pindexNew->nChainSupplyDelta = chainSupplyDelta;
-        pindexNew->nTransparentValue = transparentValueDelta;
-    } else {
-        pindexNew->nChainSupplyDelta = std::nullopt;
-        pindexNew->nTransparentValue = std::nullopt;
-    }
-
-    pindexNew->nChainTotalSupply = std::nullopt;
-    pindexNew->nChainTransparentValue = std::nullopt;
-
-    pindexNew->nSproutValue = sproutValue;
-    pindexNew->nChainSproutValue = std::nullopt;
-    pindexNew->nSaplingValue = saplingValue;
-    pindexNew->nChainSaplingValue = std::nullopt;
-    pindexNew->nOrchardValue = orchardValue;
-    pindexNew->nChainOrchardValue = std::nullopt;
 
     pindexNew->nFile = pos.nFile;
     pindexNew->nDataPos = pos.nPos;
     pindexNew->nUndoPos = 0;
     pindexNew->nStatus |= BLOCK_HAVE_DATA;
-    pindexNew->RaiseValidity(BLOCK_VALID_TRANSACTIONS);
-    setDirtyBlockIndex.insert(pindexNew);
+    pindexNew->RaiseValidity(BLOCK_PARTIALLY_VALID_TRANSACTIONS);
 
     if (pindexNew->pprev == NULL || pindexNew->pprev->nChainTx) {
-        // If pindexNew is the genesis block or all parents are BLOCK_VALID_TRANSACTIONS.
+        // If pindexNew is the genesis block or all parents are BLOCK_PARTIALLY_VALID_TRANSACTIONS.
         deque<CBlockIndex*> queue;
         queue.push_back(pindexNew);
 
@@ -4689,38 +5512,33 @@ bool ReceivedBlockTransactions(
             queue.pop_front();
             pindex->nChainTx = (pindex->pprev ? pindex->pprev->nChainTx : 0) + pindex->nTx;
 
-            if (pindex->pprev) {
-                // Transparent value and chain total supply are added to the
-                // block index only in `ConnectBlock`, because that's the only
-                // place that we have a valid coins view with which to compute
-                // the transparent input value and fees.
-
-                // Calculate the block's effect on the Sprout chain value pool balance.
-                if (pindex->pprev->nChainSproutValue && pindex->nSproutValue) {
-                    pindex->nChainSproutValue = *pindex->pprev->nChainSproutValue + *pindex->nSproutValue;
-                } else {
-                    pindex->nChainSproutValue = std::nullopt;
-                }
-
-                // Calculate the block's effect on the Sapling chain value pool balance.
-                if (pindex->pprev->nChainSaplingValue) {
-                    pindex->nChainSaplingValue = *pindex->pprev->nChainSaplingValue + pindex->nSaplingValue;
-                } else {
-                    pindex->nChainSaplingValue = std::nullopt;
-                }
-
-                // Calculate the block's effect on the Orchard chain value pool balance.
-                if (pindex->pprev->nChainOrchardValue) {
-                    pindex->nChainOrchardValue = *pindex->pprev->nChainOrchardValue + pindex->nOrchardValue;
-                } else {
-                    pindex->nChainOrchardValue = std::nullopt;
-                }
-            } else {
+            // For the genesis block, seed the supply and transparent chain
+            // totals from the per-block deltas. For non-genesis blocks, these
+            // are computed in `ConnectBlock` (which has a coins view available
+            // for computing transparent input totals).
+            if (pindex->pprev == nullptr) {
                 pindex->nChainTotalSupply = pindex->nChainSupplyDelta;
                 pindex->nChainTransparentValue = pindex->nTransparentValue;
-                pindex->nChainSproutValue = pindex->nSproutValue;
-                pindex->nChainSaplingValue = pindex->nSaplingValue;
-                pindex->nChainOrchardValue = pindex->nOrchardValue;
+            }
+
+            // Accumulate per-pool chain values (Sprout, Sapling, Orchard,
+            // Lockbox). This is idempotent with the accumulation performed in
+            // `SetChainPoolValues`; it is re-run here because out-of-order
+            // block reception can defer the parent's chain values becoming
+            // available until after `SetChainPoolValues` was called.
+            if (!AccumulateChainPoolValues(pindex)) {
+                error("ReceivedBlockTransactions(): AccumulateChainPoolValues failed at height %d", pindex->nHeight);
+                // A cumulative pool value is out of range: a deterministic
+                // consensus failure. `state` belongs to `pindexNew`, so only
+                // its own failure can be recorded through it. A descendant
+                // (linked in from `mapBlocksUnlinked`, possibly from another
+                // peer) is left for `ConnectBlock` to reject, to avoid
+                // mis-attributing the ban.
+                if (pindex == pindexNew) {
+                    return state.DoS(100, false, REJECT_INVALID,
+                        "bad-blk-pool-value-out-of-range");
+                }
+                return false;
             }
 
             // Fall back to hardcoded Sprout value pool balance
@@ -4746,6 +5564,12 @@ bool ReceivedBlockTransactions(
     }
 
     return true;
+}
+
+// This should not be used outside tests.
+void EnsureUnreferencedAsKeyOfMapBlocksUnlinked(const CBlockIndex *pindex) {
+    LOCK(cs_main);
+    assert(mapBlocksUnlinked.erase(const_cast<CBlockIndex *>(pindex)) == 0);
 }
 
 bool FindBlockPos(CValidationState &state, CDiskBlockPos &pos, unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool fKnown = false)
@@ -4842,22 +5666,36 @@ bool CheckBlockHeader(
     const CChainParams& chainparams,
     bool fCheckPOW)
 {
+    // All checks here are header-only (PoW, solution, version): they depend
+    // solely on the header bytes, never on the block body, so failures are not
+    // body-replaceable and pass `BodyCorruption::HeaderOnly`.
+
     // Check block version
     if (block.nVersion < MIN_BLOCK_VERSION)
         return state.DoS(100, error("CheckBlockHeader(): block version too low"),
-                         REJECT_INVALID, "version-too-low");
+                         REJECT_INVALID, "version-too-low", BodyCorruption::HeaderOnly);
 
     // Check Equihash solution is valid
     if (fCheckPOW && !CheckEquihashSolution(&block, chainparams.GetConsensus()))
         return state.DoS(100, error("CheckBlockHeader(): Equihash solution invalid"),
-                         REJECT_INVALID, "invalid-solution");
+                         REJECT_INVALID, "invalid-solution", BodyCorruption::HeaderOnly);
 
     // Check proof of work matches claimed amount
     if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, chainparams.GetConsensus()))
         return state.DoS(50, error("CheckBlockHeader(): proof of work failed"),
-                         REJECT_INVALID, "high-hash");
+                         REJECT_INVALID, "high-hash", BodyCorruption::HeaderOnly);
 
     return true;
+}
+
+// Verify that the block's transactions produce the expected Merkle root
+// and that the tree is not malleated (CVE-2012-2459: repeating sequences
+// of transactions can leave the Merkle root unchanged while invalidating
+// the block).
+static bool CheckBlockMerkleRoot(const CBlock& block, bool* mutated)
+{
+    uint256 computedRoot = BlockMerkleRoot(block, mutated);
+    return !*mutated && computedRoot == block.hashMerkleRoot;
 }
 
 bool CheckBlock(const CBlock& block,
@@ -4878,32 +5716,63 @@ bool CheckBlock(const CBlock& block,
     if (!CheckBlockHeader(block, state, chainparams, fCheckPOW))
         return false;
 
-    // Check the merkle root.
+    // Check the Merkle root. On success this pins the body's txids to the
+    // header's `hashMerkleRoot` (the `txid_digest` side of the body
+    // commitment); record that so `DoS` stops treating txid-pinned
+    // rejections below as body-replaceable. The two failure cases here ARE
+    // body-replaceable (a different body could reconstruct the committed
+    // Merkle root), and are flagged `BodyCorruption::Possible` since
+    // `hashMerkleRootChecked` is not yet set when they fire.
     if (fCheckMerkleRoot) {
-        bool mutated;
-        uint256 hashMerkleRoot2 = BlockMerkleRoot(block, &mutated);
-        if (block.hashMerkleRoot != hashMerkleRoot2)
-            return state.DoS(100, error("CheckBlock(): hashMerkleRoot mismatch"),
-                             REJECT_INVALID, "bad-txnmrklroot", true);
-
-        // Check for merkle tree malleability (CVE-2012-2459): repeating sequences
-        // of transactions in a block without affecting the merkle root of a block,
-        // while still invalidating it.
-        if (mutated)
-            return state.DoS(100, error("CheckBlock(): duplicate transaction"),
-                             REJECT_INVALID, "bad-txns-duplicate", true);
+        bool mutated = false;
+        if (!CheckBlockMerkleRoot(block, &mutated)) {
+            if (mutated) {
+                return state.DoS(100, error("CheckBlock(): duplicate transaction"),
+                                 REJECT_INVALID, "bad-txns-duplicate", BodyCorruption::Possible);
+            } else {
+                return state.DoS(100, error("CheckBlock(): hashMerkleRoot mismatch"),
+                                 REJECT_INVALID, "bad-txnmrklroot", BodyCorruption::Possible);
+            }
+        }
+        state.SetMerkleRootChecked();
     }
 
     // All potential-corruption validation must be done before we do any
     // transaction validation, as otherwise we may mark the header as invalid
-    // because we receive the wrong transactions for it.
+    // because we receive the wrong transactions for it. For NU5+ blocks the
+    // auth-data side of the body is not pinned until
+    // `CheckBlockBodyAuthCommitment` has run; until then the commitment-tracking
+    // flags in `state` keep body-derived rejections classified as
+    // corruption-possible via `BodyCorruption::Default`.
+    //
+    // Two rejections below carry an explicit `BodyCorruption::Possible` because
+    // they depend on fields that are authdata-bound rather than txid-bound, so
+    // they remain body-mutable even after `hashMerkleRoot` has been pinned by
+    // `SetMerkleRootChecked` above:
+    //   - `bad-blk-length`: the serialized block size includes v5 `scriptSig`
+    //     bytes, which are in `auth_digest`, not `txid_digest`.
+    //   - `bad-blk-sigops`: the sigop count walks `scriptSig`, same reason.
+    //
+    // The explicit `Possible` is defence-in-depth, not load-bearing: on both
+    // paths `BodyCorruption::Default` already yields the correct classification.
+    // On the sidechain path `hashBlockCommitmentsChecked` is still unset, so
+    // `Default` resolves to corruption-possible. On the active-tip path a body
+    // that reaches these checks has already passed `CheckBlockBodyAuthCommitment`
+    // (which set `hashBlockCommitmentsChecked`) and is therefore fully pinned to
+    // the header, so a genuine failure here is correctly *not* corruption-
+    // possible. We keep the explicit `Possible` as defence in depth against a
+    // commitment-flag logic error or a future reordering of these checks
+    // relative to the auth-commitment pre-check (cf. the matching rationale at
+    // the sidechain pre-check below).
 
     // Size limits
     if (block.vtx.empty() || block.vtx.size() > MAX_BLOCK_SIZE || ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION) > MAX_BLOCK_SIZE)
         return state.DoS(100, error("CheckBlock(): size limits failed"),
-                         REJECT_INVALID, "bad-blk-length");
+                         REJECT_INVALID, "bad-blk-length", BodyCorruption::Possible);
 
-    // First transaction must be coinbase, the rest must not be
+    // First transaction must be coinbase, the rest must not be. Coinbase-ness
+    // is determined by `vin[0].prevout`, which is pinned by `hashMerkleRoot`,
+    // so `BodyCorruption::Default` correctly classifies these post-Merkle-check.
     if (block.vtx.empty() || !block.vtx[0].IsCoinBase())
         return state.DoS(100, error("CheckBlock(): first tx is not coinbase"),
                          REJECT_INVALID, "bad-cb-missing");
@@ -4929,9 +5798,9 @@ bool CheckBlock(const CBlock& block,
     }
     if (nSigOps > MAX_BLOCK_SIGOPS)
         return state.DoS(100, error("CheckBlock(): out-of-bounds SigOpCount"),
-                         REJECT_INVALID, "bad-blk-sigops", true);
+                         REJECT_INVALID, "bad-blk-sigops", BodyCorruption::Possible);
 
-    if (fCheckPOW && fCheckMerkleRoot)
+    if (fCheckPOW && fCheckMerkleRoot && verifier.IsStrict())
         block.fChecked = true;
 
     return true;
@@ -4951,18 +5820,23 @@ bool ContextualCheckBlockHeader(
 
     int nHeight = pindexPrev->nHeight+1;
 
+    // All checks here are header-only (difficulty, timestamp, checkpoint
+    // position, version): they depend on the header and chain context, never
+    // on the block body, so failures are not body-replaceable and pass
+    // `BodyCorruption::HeaderOnly`.
+
     // Check proof of work
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams)) {
         return state.DoS(100, error("%s: incorrect proof of work", __func__),
-                         REJECT_INVALID, "bad-diffbits");
+                         REJECT_INVALID, "bad-diffbits", BodyCorruption::HeaderOnly);
     }
 
     // Check timestamp against prev
     auto medianTimePast = pindexPrev->GetMedianTimePast();
     if (block.GetBlockTime() <= medianTimePast) {
-        return state.Invalid(error("%s: block at height %d, timestamp %d is not later than median-time-past %d",
-                                   __func__, nHeight, block.GetBlockTime(), medianTimePast),
-                             REJECT_INVALID, "time-too-old");
+        return state.DoS(0, error("%s: block at height %d, timestamp %d is not later than median-time-past %d",
+                                  __func__, nHeight, block.GetBlockTime(), medianTimePast),
+                         REJECT_INVALID, "time-too-old", BodyCorruption::HeaderOnly);
     }
 
     // Check future timestamp soft fork rule introduced in v2.1.1-1.
@@ -4973,31 +5847,32 @@ bool ContextualCheckBlockHeader(
     //
     if (consensusParams.FutureTimestampSoftForkActive(nHeight) &&
           block.GetBlockTime() > medianTimePast + MAX_FUTURE_BLOCK_TIME_MTP) {
-        return state.Invalid(error("%s: block at height %d, timestamp %d is too far ahead of median-time-past, limit is %d",
-                                   __func__, nHeight, block.GetBlockTime(), medianTimePast + MAX_FUTURE_BLOCK_TIME_MTP),
-                             REJECT_INVALID, "time-too-far-ahead-of-mtp");
+        return state.DoS(0, error("%s: block at height %d, timestamp %d is too far ahead of median-time-past, limit is %d",
+                                  __func__, nHeight, block.GetBlockTime(), medianTimePast + MAX_FUTURE_BLOCK_TIME_MTP),
+                         REJECT_INVALID, "time-too-far-ahead-of-mtp", BodyCorruption::HeaderOnly);
     }
 
     // Check timestamp
     auto nTimeLimit = GetTime() + MAX_FUTURE_BLOCK_TIME_LOCAL;
     if (block.GetBlockTime() > nTimeLimit) {
-        return state.Invalid(error("%s: block at height %d, timestamp %d is too far ahead of local time, limit is %d",
-                                   __func__, nHeight, block.GetBlockTime(), nTimeLimit),
-                             REJECT_INVALID, "time-too-new");
+        return state.DoS(0, error("%s: block at height %d, timestamp %d is too far ahead of local time, limit is %d",
+                                  __func__, nHeight, block.GetBlockTime(), nTimeLimit),
+                         REJECT_INVALID, "time-too-new", BodyCorruption::HeaderOnly);
     }
 
     if (fCheckpointsEnabled) {
         // Don't accept any forks from the main chain prior to last checkpoint
         CBlockIndex* pcheckpoint = Checkpoints::GetLastCheckpoint(chainParams.Checkpoints());
         if (pcheckpoint && nHeight < pcheckpoint->nHeight) {
-            return state.DoS(100, error("%s: forked chain older than last checkpoint (height %d)", __func__, nHeight));
+            return state.DoS(100, error("%s: forked chain older than last checkpoint (height %d)", __func__, nHeight),
+                             0, "", BodyCorruption::HeaderOnly);
         }
     }
 
     // Reject block.nVersion < 4 blocks
     if (block.nVersion < 4) {
-        return state.Invalid(error("%s : rejected nVersion<4 block", __func__),
-                             REJECT_OBSOLETE, "bad-version");
+        return state.DoS(0, error("%s : rejected nVersion<4 block", __func__),
+                         REJECT_OBSOLETE, "bad-version", BodyCorruption::HeaderOnly);
     }
 
     return true;
@@ -5070,7 +5945,7 @@ bool ContextualCheckBlock(
 
         for (const CTxOut& output : block.vtx[0].vout) {
             if (output.scriptPubKey == chainparams.GetFoundersRewardScriptAtHeight(nHeight)) {
-                if (output.nValue == (GetBlockSubsidy(nHeight, consensusParams) / 5)) {
+                if (output.nValue == (consensusParams.GetBlockSubsidy(nHeight) / 5)) {
                     found = true;
                     break;
                 }
@@ -5111,10 +5986,18 @@ static bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state
     if (hash != chainparams.GetConsensus().hashGenesisBlock) {
         BlockMap::iterator mi = mapBlockIndex.find(block.hashPrevBlock);
         if (mi == mapBlockIndex.end())
-            return state.DoS(10, error("%s: prev block not found", __func__), 0, "bad-prevblk");
+            return state.DoS(10, error("%s: prev block not found", __func__), 0, "bad-prevblk", BodyCorruption::HeaderOnly);
         pindexPrev = (*mi).second;
-        if (pindexPrev->nStatus & BLOCK_FAILED_MASK)
-            return state.DoS(100, error("%s: prev block invalid", __func__), REJECT_INVALID, "bad-prevblk");
+        if (pindexPrev->nStatus & BLOCK_FAILED_MASK) {
+            int level = 100;
+            // Don't ban peers if the invalid block is because of the soft fork
+            // that temporarily disabled Orchard.
+            if (chainparams.GetConsensus().TemporaryOrchardDisablingSoftForkActive(pindexPrev->nHeight) &&
+                !chainparams.GetConsensus().NetworkUpgradeActive(pindexPrev->nHeight, Consensus::UPGRADE_NU6_2)) {
+                level = 0;
+            }
+            return state.DoS(level, error("%s: prev block invalid", __func__), REJECT_INVALID, "bad-prevblk", BodyCorruption::HeaderOnly);
+        }
     }
 
     if (!ContextualCheckBlockHeader(block, state, chainparams, pindexPrev))
@@ -5130,12 +6013,98 @@ static bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state
 }
 
 /**
+ * Pre-check that the block's `hashBlockCommitments` is consistent with the
+ * received body's authorizing data, to catch NU5+ body-poisoning attacks
+ * before the body is persisted. This also sets
+ * `state.hashBlockCommitmentsChecked`, so that once the corresponding
+ * `state.hashMerkleRootChecked` has also been set, subsequent
+ * `BodyCorruption::Default` rejections on the same `state` are no longer
+ * classified body-replaceable.
+ *
+ * The two flags are independent: this function may be called either
+ * before or after `hashMerkleRoot` has been checked, and the
+ * body-replaceable-suppression effect only takes hold once both flags
+ * are set. The active-tip pre-check in `AcceptBlock` calls this before
+ * `CheckBlock` runs the Merkle check; the sidechain path in
+ * `ConnectBlock` calls it after.
+ *
+ * This duplicates only the NU5+ branch of the full `hashBlockCommitments`
+ * validation in `ConnectBlock`, which remains the authoritative check
+ * (and the only place pre-NU5 cases —Heartwood-activation null check,
+ * Heartwood-active chain-history-root check, Sapling tree root check—
+ * are validated). Pre-NU5 blocks aren't vulnerable to body poisoning due
+ * to failing to check the auth commitments: those commitments are either
+ * independent of the current block body (Heartwood-activation,
+ * Heartwood-active) or commit to body data (Sapling tree root) that is
+ * also covered by `hashMerkleRoot`.
+ *
+ * `view` must be a coins view positioned at the chain state up to and
+ * including `pindexPrev`. The current caller (`AcceptBlock`) only invokes
+ * this when `pindexPrev == chainActive.Tip()`, so passing `*pcoinsTip`
+ * satisfies the requirement. Reconstructing the chain-history MMR state
+ * at an arbitrary `pindexPrev` would require disconnecting and
+ * reconnecting blocks, so for sidechain blocks the same check fires
+ * later in `ConnectBlock`; the body-replaceable failure path then cleans
+ * up persisted body data for the affected block index entry so that a
+ * different body for the same header can still be accepted.
+ *
+ * On mismatch, `corruptionPossible` will be set so that `InvalidBlockFound`
+ * and `ActivateBestChainStep` do not cache the failure as permanent header
+ * invalidity.
+ */
+static bool CheckBlockBodyAuthCommitment(
+    const CBlock& block,
+    int nHeight,
+    const CCoinsViewCache& view,
+    const Consensus::Params& consensusParams,
+    CValidationState& state,
+    std::optional<uint256>& hashAuthDataRoot,
+    std::optional<uint256>& hashChainHistoryRoot)
+{
+    if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_HEARTWOOD)) {
+        auto prevConsensusBranchId = CurrentEpochBranchId(nHeight - 1, consensusParams);
+        hashChainHistoryRoot = view.GetHistoryRoot(prevConsensusBranchId);
+
+        if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_NU5)) {
+            hashAuthDataRoot = block.BuildAuthDataMerkleTree();
+            // For NU5+ blocks, block.hashBlockCommitments must be the top digest
+            // of the ZIP 244 block commitments linked list.
+            // https://zips.z.cash/zip-0244#block-header-changes
+            uint256 hashBlockCommitments = DeriveBlockCommitmentsHash(
+                hashChainHistoryRoot.value(),
+                hashAuthDataRoot.value());
+            if (block.hashBlockCommitments != hashBlockCommitments) {
+                // The body's hashAuthDataRoot doesn't match what the header committed to.
+                // We pass `BodyCorruption::Possible` for defence in depth (the auth-commitment
+                // flag below is not set on this failure path, so the body is not fully pinned).
+                return state.DoS(100,
+                    error("%s: block's hashBlockCommitments is incorrect (should be ZIP 244 block commitment)", __func__),
+                    REJECT_INVALID, "bad-block-commitments-hash", BodyCorruption::Possible);
+            }
+        }
+    }
+    // The auth-data side of the body is now verified against the header's
+    // `hashBlockCommitments` (or, pre-NU5, there is no such commitment and
+    // this is vacuously satisfied). Record it. Once `hashMerkleRootChecked`
+    // is also set (by `CheckBlock`), the body is fully pinned to the header
+    // and subsequent `state.DoS` rejections are classified as
+    // non-corruption-possible by default.
+    state.SetBlockCommitmentsChecked();
+    return true;
+}
+
+/**
  * Store block on disk.
  * If dbp is non-NULL, the file is known to already reside on disk.
  *
- * JoinSplit proofs are not verified here; the only
- * caller of AcceptBlock (ProcessNewBlock) later invokes ActivateBestChain,
- * which ultimately calls ConnectBlock in a manner that can verify the proofs.
+ * JoinSplit proofs are not verified for consensus here; the only caller of
+ * AcceptBlock in the consensus path is ProcessNewBlock, which later invokes
+ * ActivateBestChain, which ultimately calls ConnectBlock in a manner that
+ * can verify the proofs.
+ *
+ * (AcceptBlock is also called from LoadExternalBlockFile in ThreadImport,
+ * but those CBlock objects are discarded, and then ActivateBestChain is
+ * called which is the consensus path in that case.)
  */
 static bool AcceptBlock(const CBlock& block, CValidationState& state, const CChainParams& chainparams, CBlockIndex** ppindex, bool fRequested, const CDiskBlockPos* dbp)
 {
@@ -5146,6 +6115,13 @@ static bool AcceptBlock(const CBlock& block, CValidationState& state, const CCha
 
     if (!AcceptBlockHeader(block, state, chainparams, &pindex))
         return false;
+
+    // The block body has been received but has NOT yet been verified against the
+    // header's commitments. This reset is per-block: a single `CValidationState`
+    // is reused across successive connections in `ActivateBestChainStep`, so the
+    // flags must start false here regardless of any prior block's checks. See
+    // `consensus/validation.h` for the structural argument.
+    state.ResetBodyCommitmentChecks();
 
     // Try to process all requested blocks that we don't have, but only
     // process an unrequested block if it's new and has enough work to
@@ -5171,6 +6147,44 @@ static bool AcceptBlock(const CBlock& block, CValidationState& state, const CCha
     // See method docstring for why these are always disabled.
     auto verifier = ProofVerifier::Disabled();
 
+    int nHeight = pindex->nHeight;
+
+    // Body-vs-header commitment pre-check for active-tip extensions.
+    // This runs BEFORE CheckBlock / ContextualCheckBlock, so that any
+    // body-mutable rejection downstream (one whose triggering field is
+    // bound by `hashAuthDataRoot` rather than `hashMerkleRoot` — e.g.
+    // per-block sigop count, transparent script verification, Sapling /
+    // Orchard proof and signature verification) cannot fire on a body
+    // whose `hashAuthDataRoot` does not match what the header committed to.
+    //
+    // This closes the GHSA-rpcw-q5mr-gq35 / GHSA-qvwc-hc2r-82qv /
+    // GHSA-382w-958v-m5jr class of NU5+ block-body poisoning structurally:
+    // the body is verified against the header's commitments before any
+    // body-mutable consensus check has the chance to mark the shared
+    // header `BLOCK_FAILED_VALID` based on a mutated body. The check also
+    // runs before the body is persisted to disk and `BLOCK_HAVE_DATA` is
+    // set on the index entry.
+    //
+    // For sidechain blocks, the check has to wait until ConnectBlock
+    // (reconstructing the chain history MMR at an arbitrary `pprev` is
+    // infeasible); the body-replaceable failure path in ConnectTip /
+    // InvalidBlockFound then cleans up persisted body data so that a
+    // subsequent matching body can still be accepted. Sidechain
+    // body-mutable rejections in CheckBlock therefore continue to pass
+    // `BodyCorruption::Possible` on each rejection that depends on a
+    // field bound by `hashAuthDataRoot`. This provides defence in depth
+    // in case of any problem with the `hashMerkleRootChecked` /
+    // `hashBlockCommitmentChecks` logic used by `BodyCorruption::Default`.
+    //
+    // Null `pindex->pprev` can only occur at genesis during a reindex.
+    if (pindex->pprev != nullptr && pindex->pprev == chainActive.Tip()) {
+        std::optional<uint256> hashAuthDataRoot_, hashChainHistoryRoot_;
+        if (!CheckBlockBodyAuthCommitment(block, nHeight, *pcoinsTip, chainparams.GetConsensus(),
+                                          state, hashAuthDataRoot_, hashChainHistoryRoot_)) {
+            return false;
+        }
+    }
+
     bool fCheckTransactions = ShouldCheckTransactions(chainparams, pindex);
     if ((!CheckBlock(block, state, chainparams, verifier, true, true, fCheckTransactions)) ||
          !ContextualCheckBlock(block, state, chainparams, pindex->pprev, fCheckTransactions)) {
@@ -5181,8 +6195,6 @@ static bool AcceptBlock(const CBlock& block, CValidationState& state, const CCha
         return false;
     }
 
-    int nHeight = pindex->nHeight;
-
     // Write block to history file
     try {
         unsigned int nBlockSize = ::GetSerializeSize(block, SER_DISK, CLIENT_VERSION);
@@ -5191,11 +6203,16 @@ static bool AcceptBlock(const CBlock& block, CValidationState& state, const CCha
             blockPos = *dbp;
         if (!FindBlockPos(state, blockPos, nBlockSize+8, nHeight, block.GetBlockTime(), dbp != NULL))
             return error("AcceptBlock(): FindBlockPos failed");
-        if (dbp == NULL)
-            if (!WriteBlockToDisk(block, blockPos, chainparams.MessageStart()))
+
+        if (dbp == NULL) {
+            if (!WriteBlockToDisk(block, blockPos, chainparams.MessageStart())) {
                 AbortNode(state, "Failed to write block");
-        if (!ReceivedBlockTransactions(block, state, chainparams, pindex, blockPos))
+            }
+        }
+        setDirtyBlockIndex.insert(pindex);
+        if (!ReceivedBlockTransactions(block, state, chainparams, pindex, blockPos)) {
             return error("AcceptBlock(): ReceivedBlockTransactions failed");
+        }
     } catch (const std::runtime_error& e) {
         return AbortNode(state, std::string("System error: ") + e.what());
     }
@@ -5251,18 +6268,30 @@ bool ProcessNewBlock(CValidationState& state, const CChainParams& chainparams, c
  * This is only invoked by the miner.
  * The block's proof-of-work is assumed invalid and not checked.
  */
-bool TestBlockValidity(
+bool TestNewBlockAtTipValidity(
     CValidationState& state, const CChainParams& chainparams,
-    const CBlock& block, CBlockIndex* pindexPrev,
-    bool fIsBlockTemplate)
+    const CBlock& block, bool fIsBlockTemplate)
 {
     AssertLockHeld(cs_main);
-    assert(pindexPrev == chainActive.Tip());
+    CBlockIndex* pindexPrev = chainActive.Tip();
+    assert(block.hashPrevBlock == pindexPrev->GetBlockHash());
+
+    // The body hasn't been verified against the header's commitments yet.
+    // Reset the commitment-tracking flags here for the same reason as in
+    // `AcceptBlock` / `ConnectBlock`. For the miner-constructed-block case the
+    // resulting `corruptionPossible` classification doesn't affect behaviour
+    // (the temporary state never reaches `BLOCK_FAILED_VALID` propagation),
+    // but keeping the flags consistent helps debugging and lets us treat
+    // body-mutable rejection codes uniformly without per-call-site exceptions.
+    state.ResetBodyCommitmentChecks();
 
     CCoinsViewCache viewNew(pcoinsTip);
     CBlockIndex indexDummy(block);
     indexDummy.pprev = pindexPrev;
     indexDummy.nHeight = pindexPrev->nHeight + 1;
+    if (!SetChainPoolValues(chainparams, block, &indexDummy)) {
+        return false;
+    }
 
     // JoinSplit proofs are verified in ConnectBlock
     auto verifier = ProofVerifier::Disabled();
@@ -5462,6 +6491,12 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
     if (!pblocktree->LoadBlockIndexGuts(InsertBlockIndex, chainparams))
         return false;
 
+    // Check whether we have ever pruned block & undo files
+    pblocktree->ReadFlag("prunedblockfiles", fHavePruned);
+    if (fHavePruned) {
+        LogPrintf("LoadBlockIndexDB(): Block files have previously been pruned\n");
+    }
+
     // Calculate nChainWork
     vector<pair<int, CBlockIndex*> > vSortedByHeight;
     vSortedByHeight.reserve(mapBlockIndex.size());
@@ -5475,6 +6510,25 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
     {
         CBlockIndex* pindex = item.second;
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + GetBlockProof(*pindex);
+
+        if (pindex->nTx == 0 && pindex->IsValid(BLOCK_PARTIALLY_VALID_TRANSACTIONS)
+                && pindex->nHeight >= chainparams.ChainSupplyCheckpointHeight() && !fHavePruned) {
+            // We want to avoid CheckRecomputedPoolDeltas below being
+            // incorrectly skipped in the `pindex->nTx == 0` case.
+            //
+            // nTx and BLOCK_PARTIALLY_VALID_TRANSACTIONS are set together
+            // in ReceivedBlockTransactions, and neither is ever cleared.
+            // So IsValid(BLOCK_PARTIALLY_VALID_TRANSACTIONS) with nTx == 0
+            // can only arise from block index corruption, not from normal
+            // operation. The !fHavePruned guard is consistent with the fact
+            // that we don't guarantee delta checking on a pruned node.
+
+            return error("%s: block at height %d was previously validated "
+                "but has no transaction data; cannot verify pool deltas. "
+                "Please restart with -reindex.",
+                __func__, pindex->nHeight);
+        }
+
         // We can link the chain of blocks for which we've received transactions at some point.
         // Pruned nodes may have deleted the block.
         if (pindex->nTx > 0) {
@@ -5482,34 +6536,36 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
                 if (pindex->pprev->nChainTx) {
                     pindex->nChainTx = pindex->pprev->nChainTx + pindex->nTx;
 
-                    if (pindex->pprev->nChainTotalSupply && pindex->nChainSupplyDelta) {
-                        pindex->nChainTotalSupply = *pindex->pprev->nChainTotalSupply + *pindex->nChainSupplyDelta;
+                    // Pre-addition range checks to prevent signed integer
+                    // overflow (UB). On-disk per-block deltas could be
+                    // corrupted, so we cannot assume they are in range.
+
+                    if (pindex->pprev->nChainTotalSupply.has_value() && pindex->nChainSupplyDelta.has_value()) {
+                        CAmount chainTotalSupply = pindex->pprev->nChainTotalSupply.value();
+                        if (!MoneyRange(chainTotalSupply) || !MoneyDeltaRange(pindex->nChainSupplyDelta.value())) {
+                            return error("%s: previous total supply value out of range at height %d", __func__, pindex->nHeight);
+                        }
+                        chainTotalSupply += pindex->nChainSupplyDelta.value();
+                        if (!MoneyRange(chainTotalSupply)) {
+                            return error("%s: new total supply value out of range at height %d", __func__, pindex->nHeight);
+                        }
+                        pindex->nChainTotalSupply = chainTotalSupply;
                     } else {
                         pindex->nChainTotalSupply = std::nullopt;
                     }
 
-                    if (pindex->pprev->nChainTransparentValue && pindex->nTransparentValue) {
-                        pindex->nChainTransparentValue = *pindex->pprev->nChainTransparentValue + *pindex->nTransparentValue;
+                    if (pindex->pprev->nChainTransparentValue.has_value() && pindex->nTransparentValue.has_value()) {
+                        CAmount chainTransparentValue = pindex->pprev->nChainTransparentValue.value();
+                        if (!MoneyRange(chainTransparentValue) || !MoneyDeltaRange(pindex->nTransparentValue.value())) {
+                            return error("%s: previous transparent value out of range at height %d", __func__, pindex->nHeight);
+                        }
+                        chainTransparentValue += pindex->nTransparentValue.value();
+                        if (!MoneyRange(chainTransparentValue)) {
+                            return error("%s: new transparent value out of range at height %d", __func__, pindex->nHeight);
+                        }
+                        pindex->nChainTransparentValue = chainTransparentValue;
                     } else {
                         pindex->nChainTransparentValue = std::nullopt;
-                    }
-
-                    if (pindex->pprev->nChainSproutValue && pindex->nSproutValue) {
-                        pindex->nChainSproutValue = *pindex->pprev->nChainSproutValue + *pindex->nSproutValue;
-                    } else {
-                        pindex->nChainSproutValue = std::nullopt;
-                    }
-
-                    if (pindex->pprev->nChainSaplingValue) {
-                        pindex->nChainSaplingValue = *pindex->pprev->nChainSaplingValue + pindex->nSaplingValue;
-                    } else {
-                        pindex->nChainSaplingValue = std::nullopt;
-                    }
-
-                    if (pindex->pprev->nChainOrchardValue) {
-                        pindex->nChainOrchardValue = *pindex->pprev->nChainOrchardValue + pindex->nOrchardValue;
-                    } else {
-                        pindex->nChainOrchardValue = std::nullopt;
                     }
                 } else {
                     pindex->nChainTx = 0;
@@ -5518,23 +6574,51 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
                     pindex->nChainSproutValue = std::nullopt;
                     pindex->nChainSaplingValue = std::nullopt;
                     pindex->nChainOrchardValue = std::nullopt;
+                    pindex->nChainLockboxValue = std::nullopt;
                     mapBlocksUnlinked.insert(std::make_pair(pindex->pprev, pindex));
                 }
             } else {
                 pindex->nChainTx = pindex->nTx;
                 pindex->nChainTotalSupply = pindex->nChainSupplyDelta;
                 pindex->nChainTransparentValue = pindex->nTransparentValue;
-                pindex->nChainSproutValue = pindex->nSproutValue;
-                pindex->nChainSaplingValue = pindex->nSaplingValue;
-                pindex->nChainOrchardValue = pindex->nOrchardValue;
+            }
+
+            // For blocks at or after the chain supply checkpoint, recompute the
+            // shielded pool deltas from the actual block data on disk and check
+            // the persisted values against them. This protects against corrupted
+            // deltas from the duplicate-header clobbering bug or other on-disk
+            // corruption.
+            if (pindex->nHeight >= chainparams.ChainSupplyCheckpointHeight()
+                    && !CheckRecomputedPoolDeltas(pindex, chainparams, fHavePruned)) {
+                return false;
+            }
+
+            // Accumulate per-pool chain values. For blocks with a parent
+            // whose nChainTx is zero (unlinked), the chain pool values
+            // were already set to nullopt above and AccumulateChainPoolValues
+            // is not called; it will be called later when the parent's data
+            // arrives. For all other cases (genesis or linked non-genesis),
+            // accumulate now.
+            if (pindex->pprev == nullptr || pindex->pprev->nChainTx) {
+                if (!AccumulateChainPoolValues(pindex)) {
+                    return error("%s: AccumulateChainPoolValues failed at height %d", __func__,
+                                 pindex->nHeight);
+                }
             }
 
             // Fall back to hardcoded Sprout value pool balance
             FallbackSproutValuePoolBalance(pindex, chainparams);
 
+            // Fall back to hardcoded chain supply values, or verify
+            // existing values match the checkpoint.
+            if (!FallbackChainSupplyCheckpoint(pindex, chainparams)) {
+                return false;
+            }
+
             // If developer option -developersetpoolsizezero has been enabled,
-            // override and set the in-memory size of shielded pools to zero.  An unshielding transaction
-            // can then be used to trigger and test the handling of turnstile violations.
+            // override and set the in-memory size of shielded pools to zero.
+            // An unshielding transaction can then be used to trigger and test
+            // the handling of turnstile violations.
             if (fExperimentalDeveloperSetPoolSizeZero) {
                 pindex->nChainSproutValue = 0;
                 pindex->nChainSaplingValue = 0;
@@ -5554,7 +6638,7 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
         } else {
             pindex->nCachedBranchId = SPROUT_BRANCH_ID;
         }
-        if (pindex->IsValid(BLOCK_VALID_TRANSACTIONS) && (pindex->nChainTx || pindex->pprev == NULL))
+        if (pindex->IsValid(BLOCK_PARTIALLY_VALID_TRANSACTIONS) && (pindex->nChainTx || pindex->pprev == NULL))
             setBlockIndexCandidates.insert(pindex);
         if (pindex->nStatus & BLOCK_FAILED_MASK && (!pindexBestInvalid || pindex->nChainWork > pindexBestInvalid->nChainWork))
             pindexBestInvalid = pindex;
@@ -5598,11 +6682,6 @@ bool static LoadBlockIndexDB(const CChainParams& chainparams)
             return false;
         }
     }
-
-    // Check whether we have ever pruned block & undo files
-    pblocktree->ReadFlag("prunedblockfiles", fHavePruned);
-    if (fHavePruned)
-        LogPrintf("LoadBlockIndexDB(): Block files have previously been pruned\n");
 
     // Check whether we need to continue reindexing
     bool fReindexing = false;
@@ -6110,7 +7189,7 @@ bool RewindBlockIndex(const CChainParams& chainparams, bool& clearWitnessCaches)
                     ++ret.first;
                 }
             }
-        } else if (pindexIter->IsValid(BLOCK_VALID_TRANSACTIONS) && pindexIter->nChainTx) {
+        } else if (pindexIter->IsValid(BLOCK_PARTIALLY_VALID_TRANSACTIONS) && pindexIter->nChainTx) {
             setBlockIndexCandidates.insert(pindexIter);
         }
     }
@@ -6233,8 +7312,10 @@ bool InitBlockIndex(const CChainParams& chainparams)
             if (!WriteBlockToDisk(block, blockPos, chainparams.MessageStart()))
                 return error("LoadBlockIndex(): writing genesis block to disk failed");
             CBlockIndex *pindex = AddToBlockIndex(block, chainparams.GetConsensus());
-            if (!ReceivedBlockTransactions(block, state, chainparams, pindex, blockPos))
+            setDirtyBlockIndex.insert(pindex);
+            if (!ReceivedBlockTransactions(block, state, chainparams, pindex, blockPos)) {
                 return error("LoadBlockIndex(): genesis block not accepted");
+            }
             // Before the genesis block, there was an empty tree. We set its root here so
             // that the block import thread doesn't race other methods that need to query
             // the Sprout tree (namely CWallet::ScanForWalletTransactions).
@@ -6405,18 +7486,18 @@ void static CheckBlockIndex(const Consensus::Params& consensusParams)
     CBlockIndex* pindexFirstMissing = NULL; // Oldest ancestor of pindex which does not have BLOCK_HAVE_DATA.
     CBlockIndex* pindexFirstNeverProcessed = NULL; // Oldest ancestor of pindex for which nTx == 0.
     CBlockIndex* pindexFirstNotTreeValid = NULL; // Oldest ancestor of pindex which does not have BLOCK_VALID_TREE (regardless of being valid or not).
-    CBlockIndex* pindexFirstNotTransactionsValid = NULL; // Oldest ancestor of pindex which does not have BLOCK_VALID_TRANSACTIONS (regardless of being valid or not).
+    CBlockIndex* pindexFirstNotTransactionsValid = NULL; // Oldest ancestor of pindex which does not have BLOCK_PARTIALLY_VALID_TRANSACTIONS (regardless of being valid or not).
     CBlockIndex* pindexFirstNotChainValid = NULL; // Oldest ancestor of pindex which does not have BLOCK_VALID_CHAIN (regardless of being valid or not).
-    CBlockIndex* pindexFirstNotScriptsValid = NULL; // Oldest ancestor of pindex which does not have BLOCK_VALID_SCRIPTS (regardless of being valid or not).
+    CBlockIndex* pindexFirstNotConsensusValid = NULL; // Oldest ancestor of pindex which does not have BLOCK_VALID_CONSENSUS (regardless of being valid or not).
     while (pindex != NULL) {
         nNodes++;
         if (pindexFirstInvalid == NULL && pindex->nStatus & BLOCK_FAILED_VALID) pindexFirstInvalid = pindex;
         if (pindexFirstMissing == NULL && !(pindex->nStatus & BLOCK_HAVE_DATA)) pindexFirstMissing = pindex;
         if (pindexFirstNeverProcessed == NULL && pindex->nTx == 0) pindexFirstNeverProcessed = pindex;
         if (pindex->pprev != NULL && pindexFirstNotTreeValid == NULL && (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_TREE) pindexFirstNotTreeValid = pindex;
-        if (pindex->pprev != NULL && pindexFirstNotTransactionsValid == NULL && (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_TRANSACTIONS) pindexFirstNotTransactionsValid = pindex;
+        if (pindex->pprev != NULL && pindexFirstNotTransactionsValid == NULL && (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_PARTIALLY_VALID_TRANSACTIONS) pindexFirstNotTransactionsValid = pindex;
         if (pindex->pprev != NULL && pindexFirstNotChainValid == NULL && (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_CHAIN) pindexFirstNotChainValid = pindex;
-        if (pindex->pprev != NULL && pindexFirstNotScriptsValid == NULL && (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_SCRIPTS) pindexFirstNotScriptsValid = pindex;
+        if (pindex->pprev != NULL && pindexFirstNotConsensusValid == NULL && (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_CONSENSUS) pindexFirstNotConsensusValid = pindex;
 
         // Begin: actual consistency checks.
         if (pindex->pprev == NULL) {
@@ -6425,8 +7506,8 @@ void static CheckBlockIndex(const Consensus::Params& consensusParams)
             assert(pindex == chainActive.Genesis()); // The current active chain's genesis block must be this block.
         }
         if (pindex->nChainTx == 0) assert(pindex->nSequenceId == 0);  // nSequenceId can't be set for blocks that aren't linked
-        // VALID_TRANSACTIONS is equivalent to nTx > 0 for all nodes (whether or not pruning has occurred).
-        // HAVE_DATA is only equivalent to nTx > 0 (or VALID_TRANSACTIONS) if no pruning has occurred.
+        // PARTIALLY_VALID_TRANSACTIONS is equivalent to nTx > 0 for all nodes (whether or not pruning has occurred).
+        // HAVE_DATA is only equivalent to nTx > 0 (or PARTIALLY_VALID_TRANSACTIONS) if no pruning has occurred.
         if (!fHavePruned) {
             // If we've never pruned, then HAVE_DATA should be equivalent to nTx > 0
             assert(!(pindex->nStatus & BLOCK_HAVE_DATA) == (pindex->nTx == 0));
@@ -6436,7 +7517,7 @@ void static CheckBlockIndex(const Consensus::Params& consensusParams)
             if (pindex->nStatus & BLOCK_HAVE_DATA) assert(pindex->nTx > 0);
         }
         if (pindex->nStatus & BLOCK_HAVE_UNDO) assert(pindex->nStatus & BLOCK_HAVE_DATA);
-        assert(((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TRANSACTIONS) == (pindex->nTx > 0)); // This is pruning-independent.
+        assert(((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_PARTIALLY_VALID_TRANSACTIONS) == (pindex->nTx > 0)); // This is pruning-independent.
         // All parents having had data (at some point) is equivalent to all parents being VALID_TRANSACTIONS, which is equivalent to nChainTx being set.
         assert((pindexFirstNeverProcessed != NULL) == (pindex->nChainTx == 0)); // nChainTx != 0 is used to signal that all parent blocks have been processed (but may have been pruned).
         assert((pindexFirstNotTransactionsValid != NULL) == (pindex->nChainTx == 0));
@@ -6446,7 +7527,7 @@ void static CheckBlockIndex(const Consensus::Params& consensusParams)
         assert(pindexFirstNotTreeValid == NULL); // All mapBlockIndex entries must at least be TREE valid
         if ((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TREE) assert(pindexFirstNotTreeValid == NULL); // TREE valid implies all parents are TREE valid
         if ((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_CHAIN) assert(pindexFirstNotChainValid == NULL); // CHAIN valid implies all parents are CHAIN valid
-        if ((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_SCRIPTS) assert(pindexFirstNotScriptsValid == NULL); // SCRIPTS valid implies all parents are SCRIPTS valid
+        if ((pindex->nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_CONSENSUS) assert(pindexFirstNotConsensusValid == NULL); // CONSENSUS valid implies all parents are CONSENSUS valid
         if (pindexFirstInvalid == NULL) {
             // Checks for not-invalid blocks.
             assert((pindex->nStatus & BLOCK_FAILED_MASK) == 0); // The failed mask cannot be set for blocks without invalid parents.
@@ -6527,7 +7608,7 @@ void static CheckBlockIndex(const Consensus::Params& consensusParams)
             if (pindex == pindexFirstNotTreeValid) pindexFirstNotTreeValid = NULL;
             if (pindex == pindexFirstNotTransactionsValid) pindexFirstNotTransactionsValid = NULL;
             if (pindex == pindexFirstNotChainValid) pindexFirstNotChainValid = NULL;
-            if (pindex == pindexFirstNotScriptsValid) pindexFirstNotScriptsValid = NULL;
+            if (pindex == pindexFirstNotConsensusValid) pindexFirstNotConsensusValid = NULL;
             // Find our parent.
             CBlockIndex* pindexPar = pindex->pprev;
             // Find which child we just visited.
@@ -6640,7 +7721,7 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
                         // To prevent fingerprinting attacks, only send blocks outside of the active
                         // chain if they are valid, and no more than a month older (both in time, and in
                         // best equivalent proof of work) than the best header chain we know about.
-                        send = mi->second->IsValid(BLOCK_VALID_SCRIPTS) && (pindexBestHeader != NULL) &&
+                        send = mi->second->IsValid(BLOCK_VALID_CONSENSUS) && (pindexBestHeader != NULL) &&
                             (pindexBestHeader->GetBlockTime() - mi->second->GetBlockTime() < nOneMonth) &&
                             (GetBlockProofEquivalentTime(*pindexBestHeader, *mi->second, *pindexBestHeader, consensusParams) < nOneMonth);
                         if (!send) {
@@ -6781,6 +7862,65 @@ void static ProcessGetData(CNode* pfrom, const Consensus::Params& consensusParam
     }
 }
 
+void static ProcessOrphanTx(const CChainParams& chainparams, std::set<uint256>& orphan_work_set) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    AssertLockHeld(cs_main);
+    set<NodeId> setMisbehaving;
+    bool done = false;
+    while (!done && !orphan_work_set.empty()) {
+        const uint256 orphanHash = *orphan_work_set.begin();
+        orphan_work_set.erase(orphan_work_set.begin());
+
+        auto orphan_it = mapOrphanTransactions.find(orphanHash);
+        if (orphan_it == mapOrphanTransactions.end()) continue;
+
+        const CTransaction& orphanTx = orphan_it->second.tx;
+        NodeId fromPeer = orphan_it->second.fromPeer;
+        bool fMissingInputs2 = false;
+        // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
+        // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
+        // anyone relaying LegitTxX banned)
+        CValidationState stateDummy;
+
+        if (setMisbehaving.count(fromPeer)) continue;
+        if (AcceptToMemoryPool(chainparams, mempool, stateDummy, orphanTx, true, &fMissingInputs2))
+        {
+            LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
+            RelayTransaction(orphanTx);
+            for (unsigned int i = 0; i < orphanTx.vout.size(); i++) {
+                auto it_by_prev = mapOrphanTransactionsByPrev.find(COutPoint(orphanHash, i));
+                if (it_by_prev != mapOrphanTransactionsByPrev.end()) {
+                    for (const auto& elem : it_by_prev->second) {
+                        orphan_work_set.insert(elem->first);
+                    }
+                }
+            }
+            EraseOrphanTx(orphanHash);
+            done = true;
+        } else if (!fMissingInputs2) {
+            int nDos = 0;
+            if (stateDummy.IsInvalid(nDos) && nDos > 0) {
+                // Punish peer that gave us an invalid orphan tx
+                Misbehaving(fromPeer, nDos);
+                setMisbehaving.insert(fromPeer);
+                LogPrint("mempool", "   invalid orphan tx %s\n", orphanHash.ToString());
+            }
+            // Has inputs but not accepted to mempool
+            // Probably non-standard or insufficient fee
+            LogPrint("mempool", "   removed orphan tx %s\n", orphanHash.ToString());
+            // Add the wtxid of this transaction to our reject filter.
+            // Unlike upstream Bitcoin Core, we can unconditionally add
+            // these, as they are always bound to the entirety of the
+            // transaction regardless of version.
+            assert(recentRejects);
+            recentRejects->insert(orphanTx.GetWTxId().ToBytes());
+            EraseOrphanTx(orphanHash);
+            done = true;
+        }
+        mempool.check(pcoinsTip);
+    }
+}
+
 bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
     LogPrint("net", "received: %s (%u bytes) peer=%d\n", SanitizeString(strCommand), vRecv.size(), pfrom->id);
@@ -6796,78 +7936,93 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
         // Each connection can only send one version message
         if (pfrom->nVersion != 0)
         {
-            pfrom->PushMessage("reject", strCommand, REJECT_DUPLICATE, string("Duplicate version message"));
+            pfrom->PushMessage("reject", strCommand, REJECT_DUPLICATE, std::string("Duplicate version message"));
             LOCK(cs_main);
             Misbehaving(pfrom->GetId(), 1);
             return false;
         }
 
-        int64_t nTime;
+        // It's necessary to initialize nVersion because if the message is less than 4 bytes,
+        // it will not be set (but is read in the catch block for std::ios_base::failure).
+        int32_t nVersion = 0;
+        int64_t nTime = 0;
         CAddress addrMe;
         CAddress addrFrom;
         uint64_t nNonce = 1;
         std::string strSubVer;
         std::string cleanSubVer;
-        uint64_t nServices;
-        vRecv >> pfrom->nVersion >> nServices >> nTime >> addrMe;
-        pfrom->nServices = nServices;
-        if (pfrom->nVersion < MIN_PEER_PROTO_VERSION)
-        {
-            // disconnect from peers older than this proto version
-            LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
-            pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
-                               strprintf("Version must be %d or greater", MIN_PEER_PROTO_VERSION));
+        try {
+            uint64_t nServices;
+            vRecv >> nVersion >> nServices >> nTime >> addrMe;
+
+            if (nVersion < MIN_PEER_PROTO_VERSION)
+            {
+                // disconnect from peers older than this proto version
+                LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, nVersion);
+                pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
+                                   strprintf("Version must be %d or greater", MIN_PEER_PROTO_VERSION));
+                pfrom->fDisconnect = true;
+                return false;
+            }
+
+            if (chainparams.NetworkIDString() == "test" &&
+                nVersion < MIN_TESTNET_PEER_PROTO_VERSION)
+            {
+                // disconnect from testnet peers older than this proto version
+                LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, nVersion);
+                pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
+                                   strprintf("Version must be %d or greater", MIN_TESTNET_PEER_PROTO_VERSION));
+                pfrom->fDisconnect = true;
+                return false;
+            }
+
+            // Reject incoming connections from nodes that don't know about the current epoch
+            const Consensus::Params& consensusParams = chainparams.GetConsensus();
+            auto currentEpoch = CurrentEpoch(GetHeight(), consensusParams);
+            if (nVersion < consensusParams.vUpgrades[currentEpoch].nProtocolVersion &&
+                !(
+                    chainparams.NetworkIDString() == "regtest" &&
+                    !GetBoolArg("-nurejectoldversions", DEFAULT_NU_REJECT_OLD_VERSIONS)
+                )
+            ) {
+                LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, nVersion);
+                pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
+                                   strprintf("Version must be %d or greater",
+                                   consensusParams.vUpgrades[currentEpoch].nProtocolVersion));
+                pfrom->fDisconnect = true;
+                return false;
+            }
+
+            // We've successfully parsed the mandatory fields and checked the version.
+            // It's safe to leave these set even if subsequent parsing fails.
+            pfrom->nVersion = nVersion;
+            pfrom->nServices = nServices;
+
+            if (!vRecv.empty()) {
+                vRecv >> addrFrom >> nNonce;
+            }
+            if (!vRecv.empty()) {
+                vRecv >> LIMITED_STRING(strSubVer, MAX_SUBVERSION_LENGTH);
+                cleanSubVer = SanitizeString(strSubVer, SAFE_CHARS_SUBVERSION);
+            }
+            if (!vRecv.empty()) {
+                int32_t nStartingHeight;
+                vRecv >> nStartingHeight;
+                pfrom->nStartingHeight = nStartingHeight;
+            }
+            {
+                LOCK(pfrom->cs_filter);
+                if (!vRecv.empty()) {
+                    vRecv >> pfrom->fRelayTxes; // set to true after we get the first filter* message
+                } else {
+                    pfrom->fRelayTxes = true;
+                }
+            }
+        } catch (const std::ios_base::failure&) {
+            LogPrintf("peer=%d using version %i sent malformed version message; disconnecting\n", pfrom->id, nVersion);
+            pfrom->PushMessage("reject", strCommand, REJECT_MALFORMED, std::string("Malformed version message"));
             pfrom->fDisconnect = true;
             return false;
-        }
-
-        if (chainparams.NetworkIDString() == "test" &&
-            pfrom->nVersion < MIN_TESTNET_PEER_PROTO_VERSION)
-        {
-            // disconnect from testnet peers older than this proto version
-            LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
-            pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
-                               strprintf("Version must be %d or greater", MIN_TESTNET_PEER_PROTO_VERSION));
-            pfrom->fDisconnect = true;
-            return false;
-        }
-
-        // Reject incoming connections from nodes that don't know about the current epoch
-        const Consensus::Params& consensusParams = chainparams.GetConsensus();
-        auto currentEpoch = CurrentEpoch(GetHeight(), consensusParams);
-        if (pfrom->nVersion < consensusParams.vUpgrades[currentEpoch].nProtocolVersion &&
-            !(
-                chainparams.NetworkIDString() == "regtest" &&
-                !GetBoolArg("-nurejectoldversions", DEFAULT_NU_REJECT_OLD_VERSIONS)
-            )
-        ) {
-            LogPrintf("peer=%d using obsolete version %i; disconnecting\n", pfrom->id, pfrom->nVersion);
-            pfrom->PushMessage("reject", strCommand, REJECT_OBSOLETE,
-                            strprintf("Version must be %d or greater",
-                            consensusParams.vUpgrades[currentEpoch].nProtocolVersion));
-            pfrom->fDisconnect = true;
-            return false;
-        }
-
-        if (pfrom->nVersion == 10300)
-            pfrom->nVersion = 300;
-        if (!vRecv.empty())
-            vRecv >> addrFrom >> nNonce;
-        if (!vRecv.empty()) {
-            vRecv >> LIMITED_STRING(strSubVer, MAX_SUBVERSION_LENGTH);
-            cleanSubVer = SanitizeString(strSubVer, SAFE_CHARS_SUBVERSION);
-        }
-        if (!vRecv.empty()) {
-            int nStartingHeight;
-            vRecv >> nStartingHeight;
-            pfrom->nStartingHeight = nStartingHeight;
-        }
-        {
-            LOCK(pfrom->cs_filter);
-            if (!vRecv.empty())
-                vRecv >> pfrom->fRelayTxes; // set to true after we get the first filter* message
-            else
-                pfrom->fRelayTxes = true;
         }
 
         // Disconnect if we connected to ourself
@@ -6942,13 +8097,7 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
             }
         }
 
-        // Relay alerts
-        {
-            LOCK(cs_mapAlerts);
-            for (std::pair<const uint256, CAlert>& item : mapAlerts)
-                item.second.RelayTo(pfrom);
-        }
-
+        pfrom->nTimeOffset = timeWarning.AddTimeData(pfrom->addr, nTime, GetTime());
         pfrom->fSuccessfullyConnected = true;
 
         string remoteAddr;
@@ -6959,8 +8108,6 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
                   cleanSubVer, pfrom->nVersion,
                   pfrom->nStartingHeight, addrMe.ToString(), pfrom->id,
                   remoteAddr);
-
-        pfrom->nTimeOffset = timeWarning.AddTimeData(pfrom->addr, nTime, GetTime());
     }
 
 
@@ -6975,12 +8122,19 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
 
     else if (strCommand == "verack")
     {
+        LOCK(cs_main);
+        CNodeState* state = State(pfrom->GetId());
+        assert(state != nullptr);
+        if (state->fCurrentlyConnected) {
+            pfrom->PushMessage("reject", strCommand, REJECT_DUPLICATE, std::string("Duplicate verack message"));
+            Misbehaving(pfrom->GetId(), 1);
+            return false;
+        }
         pfrom->SetRecvVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
 
         // Mark this node as currently connected, so we update its timestamp later.
         if (pfrom->fNetworkNode) {
-            LOCK(cs_main);
-            State(pfrom->GetId())->fCurrentlyConnected = true;
+            state->fCurrentlyConnected = true;
         }
     }
 
@@ -7122,7 +8276,7 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
 
         LOCK(cs_main);
 
-        std::vector<CInv> vToFetch;
+        const uint256* best_block{nullptr};
 
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
         {
@@ -7136,29 +8290,14 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
             if (inv.type == MSG_BLOCK) {
                 UpdateBlockAvailability(pfrom->GetId(), inv.hash);
                 if (!fAlreadyHave && !fImporting && !fReindex && !mapBlocksInFlight.count(inv.hash)) {
-                    // First request the headers preceding the announced block. In the normal fully-synced
-                    // case where a new block is announced that succeeds the current tip (no reorganization),
-                    // there are no such headers.
-                    // Secondly, and only when we are close to being synced, we request the announced block directly,
-                    // to avoid an extra round-trip. Note that we must *first* ask for the headers, so by the
-                    // time the block arrives, the header chain leading up to it is already validated. Not
-                    // doing this will result in the received block being rejected as an orphan in case it is
-                    // not a direct successor.
-                    pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), inv.hash);
-                    CNodeState *nodestate = State(pfrom->GetId());
-
-                    if (chainActive.Tip()->GetBlockTime() > GetTime() - chainparams.GetConsensus().PoWTargetSpacing(pindexBestHeader->nHeight) * 20 &&
-                        nodestate->nBlocksInFlight < MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
-                        vToFetch.push_back(inv);
-                        // Mark block as in flight already, even though the actual "getdata" message only goes out
-                        // later (within the same cs_main lock, though).
-                        MarkBlockAsInFlight(pfrom->GetId(), inv.hash, chainparams.GetConsensus());
-                    }
-                    LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, inv.hash.ToString(), pfrom->id);
+                    // Headers-first is the primary method of announcement on
+                    // the network. If a node fell back to sending blocks by inv,
+                    // it's probably for a re-org. The final block hash
+                    // provided should be the highest, so send a getheaders and
+                    // then fetch the blocks we need to catch up.
+                    best_block = &inv.hash;
                 }
-            }
-            else
-            {
+            } else {
                 pfrom->AddKnownWTxId(WTxId(inv.hash, inv.hashAux));
                 if (fBlocksOnly)
                     LogPrint("net", "transaction (%s) inv sent in violation of protocol peer=%d\n", inv.hash.ToString(), pfrom->id);
@@ -7172,8 +8311,10 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
             }
         }
 
-        if (!vToFetch.empty())
-            pfrom->PushMessage("getdata", vToFetch);
+        if (best_block != nullptr) {
+            pfrom->PushMessage("getheaders", chainActive.GetLocator(pindexBestHeader), *best_block);
+            LogPrint("net", "getheaders (%d) %s to peer=%d\n", pindexBestHeader->nHeight, best_block->ToString(), pfrom->id);
+        }
     }
 
 
@@ -7295,8 +8436,6 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
             return true;
         }
 
-        vector<uint256> vWorkQueue;
-        vector<uint256> vEraseQueue;
         CTransaction tx;
         vRecv >> tx;
 
@@ -7321,7 +8460,14 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
         {
             mempool.check(pcoinsTip);
             RelayTransaction(tx);
-            vWorkQueue.push_back(txid);
+            for (unsigned int i = 0; i < tx.vout.size(); i++) {
+                auto it_by_prev = mapOrphanTransactionsByPrev.find(COutPoint(txid, i));
+                if (it_by_prev != mapOrphanTransactionsByPrev.end()) {
+                    for (const auto& elem : it_by_prev->second) {
+                        pfrom->orphan_work_set.insert(elem->first);
+                    }
+                }
+            }
 
             LogPrint("mempool", "AcceptToMemoryPool: peer=%d %s: accepted %s (poolsz %u txn, %u kB)\n",
                 pfrom->id, pfrom->cleanSubVer,
@@ -7329,62 +8475,7 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
                 mempool.size(), mempool.DynamicMemoryUsage() / 1000);
 
             // Recursively process any orphan transactions that depended on this one
-            set<NodeId> setMisbehaving;
-            for (unsigned int i = 0; i < vWorkQueue.size(); i++)
-            {
-                map<uint256, set<uint256> >::iterator itByPrev = mapOrphanTransactionsByPrev.find(vWorkQueue[i]);
-                if (itByPrev == mapOrphanTransactionsByPrev.end())
-                    continue;
-                for (set<uint256>::iterator mi = itByPrev->second.begin();
-                     mi != itByPrev->second.end();
-                     ++mi)
-                {
-                    const uint256& orphanHash = *mi;
-                    const CTransaction& orphanTx = mapOrphanTransactions[orphanHash].tx;
-                    NodeId fromPeer = mapOrphanTransactions[orphanHash].fromPeer;
-                    bool fMissingInputs2 = false;
-                    // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
-                    // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
-                    // anyone relaying LegitTxX banned)
-                    CValidationState stateDummy;
-
-
-                    if (setMisbehaving.count(fromPeer))
-                        continue;
-                    if (AcceptToMemoryPool(chainparams, mempool, stateDummy, orphanTx, true, &fMissingInputs2))
-                    {
-                        LogPrint("mempool", "   accepted orphan tx %s\n", orphanHash.ToString());
-                        RelayTransaction(orphanTx);
-                        vWorkQueue.push_back(orphanHash);
-                        vEraseQueue.push_back(orphanHash);
-                    }
-                    else if (!fMissingInputs2)
-                    {
-                        int nDos = 0;
-                        if (stateDummy.IsInvalid(nDos) && nDos > 0)
-                        {
-                            // Punish peer that gave us an invalid orphan tx
-                            Misbehaving(fromPeer, nDos);
-                            setMisbehaving.insert(fromPeer);
-                            LogPrint("mempool", "   invalid orphan tx %s\n", orphanHash.ToString());
-                        }
-                        // Has inputs but not accepted to mempool
-                        // Probably non-standard or insufficient fee
-                        LogPrint("mempool", "   removed orphan tx %s\n", orphanHash.ToString());
-                        vEraseQueue.push_back(orphanHash);
-                        // Add the wtxid of this transaction to our reject filter.
-                        // Unlike upstream Bitcoin Core, we can unconditionally add
-                        // these, as they are always bound to the entirety of the
-                        // transaction regardless of version.
-                        assert(recentRejects);
-                        recentRejects->insert(orphanTx.GetWTxId().ToBytes());
-                    }
-                    mempool.check(pcoinsTip);
-                }
-            }
-
-            for (uint256 hash : vEraseQueue)
-                EraseOrphanTx(hash);
+            ProcessOrphanTx(chainparams, pfrom->orphan_work_set);
         }
         // TODO: currently, prohibit joinsplits and shielded spends/outputs/actions from entering mapOrphans
         else if (fMissingInputs &&
@@ -7392,13 +8483,30 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
                  !tx.GetSaplingBundle().IsPresent() &&
                  !tx.GetOrchardBundle().IsPresent())
         {
-            AddOrphanTx(tx, pfrom->GetId());
+            bool fRejectedParents = false; // It may be the case that the orphan's parents have all been rejected
+            for (const CTxIn& txin : tx.vin) {
+                if (recentRejects->contains(txin.prevout.hash)) {
+                    fRejectedParents = true;
+                    break;
+                }
+            }
+            if (!fRejectedParents) {
+                for (const CTxIn& txin : tx.vin) {
+                    CInv inv(MSG_TX, txin.prevout.hash);
+                    pfrom->AddKnownTxId(inv.hash);
+                    if (!AlreadyHave(inv)) pfrom->AskFor(inv);
+                }
+                AddOrphanTx(tx, pfrom->GetId());
 
-            // DoS prevention: do not allow mapOrphanTransactions to grow unbounded
-            unsigned int nMaxOrphanTx = (unsigned int)std::max((int64_t)0, GetArg("-maxorphantx", DEFAULT_MAX_ORPHAN_TRANSACTIONS));
-            unsigned int nEvicted = LimitOrphanTxSize(nMaxOrphanTx);
-            if (nEvicted > 0)
-                LogPrint("mempool", "mapOrphan overflow, removed %u tx\n", nEvicted);
+                // DoS prevention: do not allow mapOrphanTransactions and
+                // mapOrphanTransactionsByPrev to grow unbounded.
+                unsigned int nMaxOrphanTx = (unsigned int)std::max((int64_t)0, GetArg("-maxorphantx", DEFAULT_MAX_ORPHAN_TRANSACTIONS));
+                unsigned int nEvicted = LimitOrphanTxSize(nMaxOrphanTx);
+                if (nEvicted > 0)
+                    LogPrint("mempool", "mapOrphan overflow, removed %u tx\n", nEvicted);
+            } else {
+                LogPrint("mempool", "not keeping orphan with rejected parents %s\n",tx.GetHash().ToString());
+            }
         } else {
             // Add the wtxid of this transaction to our reject filter.
             // Unlike upstream Bitcoin Core, we can unconditionally add
@@ -7663,38 +8771,6 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
     }
 
 
-    else if (fAlerts && strCommand == "alert")
-    {
-        CAlert alert;
-        vRecv >> alert;
-
-        uint256 alertHash = alert.GetHash();
-        if (pfrom->setKnown.count(alertHash) == 0)
-        {
-            if (alert.ProcessAlert(chainparams.AlertKey()))
-            {
-                // Relay
-                pfrom->setKnown.insert(alertHash);
-                {
-                    LOCK(cs_vNodes);
-                    for (CNode* pnode : vNodes)
-                        alert.RelayTo(pnode);
-                }
-            }
-            else {
-                // Small DoS penalty so peers that send us lots of
-                // duplicate/expired/invalid-signature/whatever alerts
-                // eventually get banned.
-                // This isn't a Misbehaving(100) (immediate ban) because the
-                // peer might be an older or different implementation with
-                // a different signature key, etc.
-                LOCK(cs_main);
-                Misbehaving(pfrom->GetId(), 10);
-            }
-        }
-    }
-
-
     else if (!(nLocalServices & NODE_BLOOM) &&
               (strCommand == "filterload" ||
                strCommand == "filteradd"))
@@ -7797,7 +8873,7 @@ bool static ProcessMessage(const CChainParams& chainparams, CNode* pfrom, string
         // message would be undesirable as we transmit it ourselves.
     }
 
-    else if (!(strCommand == "tx" || strCommand == "block" || strCommand == "headers" || strCommand == "alert")) {
+    else if (!(strCommand == "tx" || strCommand == "block" || strCommand == "headers")) {
         // Ignore unknown commands for extensibility
         LogPrint("net", "Unknown command \"%s\" from peer=%d\n", SanitizeString(strCommand), pfrom->id);
     }
@@ -7826,8 +8902,14 @@ bool ProcessMessages(const CChainParams& chainparams, CNode* pfrom)
     if (!pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom, chainparams.GetConsensus());
 
+    if (!pfrom->orphan_work_set.empty()) {
+        LOCK(cs_main);
+        ProcessOrphanTx(chainparams, pfrom->orphan_work_set);
+    }
+
     // this maintains the order of responses
     if (!pfrom->vRecvGetData.empty()) return fOk;
+    if (!pfrom->orphan_work_set.empty()) return true;
 
     std::deque<CNetMessage>::iterator it = pfrom->vRecvMsg.begin();
     while (!pfrom->fDisconnect && it != pfrom->vRecvMsg.end()) {
@@ -8336,7 +9418,7 @@ CMutableTransaction CreateNewContextualCMutableTransaction(
 
         // mtx.nExpiryHeight == 0 is valid for coinbase transactions
         if (mtx.nExpiryHeight <= 0 || mtx.nExpiryHeight >= TX_EXPIRY_HEIGHT_THRESHOLD) {
-            throw new std::runtime_error("CreateNewContextualCMutableTransaction: invalid expiry height");
+            throw std::runtime_error("CreateNewContextualCMutableTransaction: invalid expiry height");
         }
 
         // NOTE: If the expiry height crosses into an incompatible consensus epoch, and it is changed to the last block

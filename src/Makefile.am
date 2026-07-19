@@ -1,6 +1,6 @@
 # Copyright (c) 2016-2019 The Zcash developers
 # Copyright (c) 2013-2019 The Bitcoin Core developers
-# Copyright (c) 2013-2019 Bitcoin Developers
+# Copyright (c) 2013-2025 Bitcoin Developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -36,9 +36,6 @@ LIBSECP256K1=secp256k1/libsecp256k1.la
 LIBUNIVALUE=univalue/libunivalue.la
 LIBZCASH=libzcash.a
 
-INSPECT_TOOL_BIN=zcash-inspect$(EXEEXT)
-INSPECT_TOOL_BUILD=$(top_builddir)/target/$(RUST_TARGET)/release/zcash-inspect$(EXEEXT)
-
 WALLET_TOOL_BIN=zcashd-wallet-tool$(EXEEXT)
 WALLET_TOOL_BUILD=$(top_builddir)/target/$(RUST_TARGET)/release/zcashd-wallet-tool$(EXEEXT)
 
@@ -56,18 +53,36 @@ CXXBRIDGE_RS = \
   rust/src/blake2b.rs \
   rust/src/ed25519.rs \
   rust/src/equihash.rs \
+  rust/src/history.rs \
+  rust/src/init.rs \
+  rust/src/random.rs \
+  rust/src/sapling/spec.rs \
+  rust/src/sapling/zip32.rs \
+  rust/src/sprout.rs \
   rust/src/streams.rs \
   rust/src/bridge.rs
 CXXBRIDGE_H = \
   rust/gen/include/rust/blake2b.h \
   rust/gen/include/rust/ed25519.h \
   rust/gen/include/rust/equihash.h \
+  rust/gen/include/rust/history.h \
+  rust/gen/include/rust/init.h \
+  rust/gen/include/rust/random.h \
+  rust/gen/include/rust/sapling/spec.h \
+  rust/gen/include/rust/sapling/zip32.h \
+  rust/gen/include/rust/sprout.h \
   rust/gen/include/rust/streams.h \
   rust/gen/include/rust/bridge.h
 CXXBRIDGE_CPP = \
   rust/gen/src/blake2b.cpp \
   rust/gen/src/ed25519.cpp \
   rust/gen/src/equihash.cpp \
+  rust/gen/src/history.cpp \
+  rust/gen/src/init.cpp \
+  rust/gen/src/random.cpp \
+  rust/gen/src/sapling/spec.cpp \
+  rust/gen/src/sapling/zip32.cpp \
+  rust/gen/src/sprout.cpp \
   rust/gen/src/streams.cpp \
   rust/gen/src/bridge.cpp
 
@@ -78,7 +93,7 @@ CXXBRIDGE_OPTS = -i rust/cxx.h
 $(CXXBRIDGE_RS): ;
 $(CXXBRIDGE_H) $(CXXBRIDGE_CPP): $(CXXBRIDGE_RS)
 	@$(MKDIR_P) $(@D)
-	$(AM_V_GEN)$(CXXBRIDGE) $(CXXBRIDGE_OPTS) rust/src/$(basename $(@F)).rs -o $@
+	$(AM_V_GEN)$(CXXBRIDGE) $(CXXBRIDGE_OPTS) $(basename $(patsubst rust/gen/include/rust/%,rust/src/%,$(patsubst rust/gen/src/%,rust/src/%,$@))).rs -o $@
 
 # We pass through CC etc. flags so they are available to Rust dependencies that internally
 # compile C or C++ code with the `cc` crate.
@@ -90,6 +105,11 @@ $(CXXBRIDGE_H) $(CXXBRIDGE_CPP): $(CXXBRIDGE_RS)
 # same library as the C++ code.
 # - Note that this does not prevent the secp256k1-sys vendored code from being built; this
 #   requires https://github.com/rust-bitcoin/rust-secp256k1/issues/380 to be addressed.
+# Cargo's per-target *_LINKER expects a single program, and linking does not
+# benefit from ccache (which wraps compilation, not linking). $(CC) carries a
+# "ccache <compiler>" prefix, so pass just the compiler (the last word) as the
+# Windows (gnullvm) Rust linker.
+RUST_TARGET_LINKER = $(lastword $(CC))
 RUST_ENV_VARS = \
   RUSTC="$(RUSTC)" \
   RUSTFLAGS="--cfg=rust_secp_no_symbol_renaming -L native=$(abs_top_srcdir)/src/secp256k1/.libs" \
@@ -97,6 +117,7 @@ RUST_ENV_VARS = \
   CFLAGS="$(CFLAGS)" \
   CXX="$(CXX)" \
   CXXFLAGS="$(CXXFLAGS)" \
+  CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER="$(RUST_TARGET_LINKER)" \
   TERM=dumb
 RUST_BUILD_OPTS = --release --target $(RUST_TARGET) --manifest-path $(top_srcdir)/Cargo.toml
 
@@ -109,10 +130,11 @@ cargo_verbose_ = $(cargo_verbose_@AM_DEFAULT_V@)
 cargo_verbose_1 = --verbose
 
 if ENABLE_ONLINE_RUST
-# Ensure that .cargo/config does not exist
+# Ensure that .cargo/config.toml (or the older .cargo/config) does not exist.
 CARGO_CONFIGURED = $(top_srcdir)/.cargo/.configured-for-online
 $(CARGO_CONFIGURED):
-	$(AM_V_at)rm -f $(top_srcdir)/.cargo/.configured-for-offline $(top_srcdir)/.cargo/config
+	$(AM_V_at)rm -f $(top_srcdir)/.cargo/.configured-for-offline $(top_srcdir)/.cargo/config.toml
+	$(AM_V_at)rm -f $(top_srcdir)/.cargo/config
 	$(AM_V_at)touch $@
 
 else
@@ -120,10 +142,11 @@ else
 RUST_BUILD_OPTS += --locked --offline
 
 CARGO_CONFIGURED = $(top_srcdir)/.cargo/.configured-for-offline
-$(CARGO_CONFIGURED): $(top_srcdir)/.cargo/config.offline
+$(CARGO_CONFIGURED): $(top_srcdir)/.cargo/config.toml.offline
 	$(AM_V_at)rm -f $(top_srcdir)/.cargo/.configured-for-online
-	$(AM_V_at)cp $< $(top_srcdir)/.cargo/config
-	$(AM_V_at)echo "directory = \"$(RUST_VENDORED_SOURCES)\"" >>$(top_srcdir)/.cargo/config
+	$(AM_V_at)rm -f $(top_srcdir)/.cargo/config
+	$(AM_V_at)cp $< $(top_srcdir)/.cargo/config.toml
+	$(AM_V_at)echo "directory = \"$(RUST_VENDORED_SOURCES)\"" >>$(top_srcdir)/.cargo/config.toml
 	$(AM_V_at)touch $@
 endif
 if ENABLE_SHANI
@@ -137,9 +160,6 @@ cargo-build: $(CARGO_CONFIGURED) $(LIBSECP256K1)
 cargo-build-lib: cargo-build
 
 cargo-build-bins: cargo-build
-
-$(INSPECT_TOOL_BIN): cargo-build-bins
-	$(AM_V_at)cp $(INSPECT_TOOL_BUILD) $@
 
 $(WALLET_TOOL_BIN): cargo-build-bins
 	$(AM_V_at)cp $(WALLET_TOOL_BUILD) $@
@@ -190,7 +210,7 @@ endif
 
 if BUILD_BITCOIN_UTILS
   bin_PROGRAMS += zcash-cli zcash-tx
-  bin_SCRIPTS += $(INSPECT_TOOL_BIN) $(WALLET_TOOL_BIN)
+  bin_SCRIPTS += $(WALLET_TOOL_BIN)
 endif
 
 LIBZCASH_H = \
@@ -237,7 +257,6 @@ BITCOIN_CORE_H = \
   compat.h \
   compat/byteswap.h \
   compat/endian.h \
-  compat/sanity.h \
   compressor.h \
   consensus/consensus.h \
   core_io.h \
@@ -308,6 +327,7 @@ BITCOIN_CORE_H = \
   util/string.h \
   util/test.h \
   util/time.h \
+  util/vector.h \
   validationinterface.h \
   wallet/asyncrpcoperation_common.h \
   wallet/asyncrpcoperation_mergetoaddress.h \
@@ -343,11 +363,9 @@ libbitcoin_util_a-clientversion.$(OBJEXT): obj/build.h
 libbitcoin_server_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(EVENT_CFLAGS) $(EVENT_PTHREADS_CFLAGS)
 libbitcoin_server_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libbitcoin_server_a_SOURCES = \
-  sendalert.cpp \
   addrman.cpp \
   addrdb.cpp \
   alert.cpp \
-  alertkeys.h \
   asyncrpcoperation.cpp \
   asyncrpcqueue.cpp \
   bloom.cpp \
@@ -569,16 +587,12 @@ libbitcoin_common_a_SOURCES = \
   $(LIBZCASH_H)
 
 # util: shared between all executables.
-# This library *must* be included to make sure that the glibc
-# backward-compatibility objects and their sanity checks are linked.
 libbitcoin_util_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
 libbitcoin_util_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libbitcoin_util_a_SOURCES = \
   support/lockedpool.cpp \
   chainparamsbase.cpp \
   clientversion.cpp \
-  compat/glibc_sanity.cpp \
-  compat/glibcxx_sanity.cpp \
   compat/strnlen.cpp \
   fs.cpp \
   logging.cpp \
@@ -593,10 +607,6 @@ libbitcoin_util_a_SOURCES = \
   util/time.cpp \
   $(BITCOIN_CORE_H) \
   $(LIBZCASH_H)
-
-if GLIBC_BACK_COMPAT
-libbitcoin_util_a_SOURCES += compat/glibc_compat.cpp
-endif
 
 # cli: zcash-cli
 libbitcoin_cli_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
@@ -728,10 +738,6 @@ libzcash_script_la_SOURCES = \
   support/cleanse.cpp \
   uint256.cpp
 
-if GLIBC_BACK_COMPAT
-  libzcash_script_la_SOURCES += compat/glibc_compat.cpp
-endif
-
 libzcash_script_la_LDFLAGS = $(AM_LDFLAGS) -no-undefined $(RELDFLAGS)
 libzcash_script_la_LIBADD = $(LIBRUSTZCASH) $(LIBSECP256K1)
 libzcash_script_la_CPPFLAGS = $(AM_CPPFLAGS) -I$(builddir)/obj -I$(srcdir)/rust/include -I$(srcdir)/rust/gen/include -I$(srcdir)/secp256k1/include -DBUILD_BITCOIN_INTERNAL
@@ -755,7 +761,7 @@ DISTCLEANFILES = obj/build.h
 EXTRA_DIST = $(CTAES_DIST) rust
 
 clean-local:
-	rm -f $(top_srcdir)/.cargo/config $(top_srcdir)/.cargo/.configured-for-*
+	rm -f $(top_srcdir)/.cargo/config.toml $(top_srcdir)/.cargo/config $(top_srcdir)/.cargo/.configured-for-*
 	-$(MAKE) -C secp256k1 clean
 	-$(MAKE) -C univalue clean
 	rm -f leveldb/*/*.gcno leveldb/helpers/memenv/*.gcno
@@ -770,7 +776,7 @@ clean-local:
 	$(AM_V_GEN) $(WINDRES) -DWINDRES_PREPROC -i $< -o $@
 
 check-symbols: $(bin_PROGRAMS) $(bin_SCRIPTS)
-if GLIBC_BACK_COMPAT
+if TARGET_LINUX
 	@echo "Checking glibc back compat of [$(bin_PROGRAMS) $(bin_SCRIPTS)]..."
 	$(AM_V_at) READELF=$(READELF) CPPFILT=$(CPPFILT) $(top_srcdir)/contrib/devtools/symbol-check.py $(bin_PROGRAMS) $(bin_SCRIPTS)
 endif

@@ -1,6 +1,6 @@
 // Copyright (c) 2010 Satoshi Nakamoto
 // Copyright (c) 2009-2014 The Bitcoin Core developers
-// Copyright (c) 2015-2023 The Zcash developers
+// Copyright (c) 2015-2025 The Zcash developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -139,6 +139,13 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight = 1687104;
         consensus.vUpgrades[Consensus::UPGRADE_NU5].hashActivationBlock =
             uint256S("0000000000d723156d9b65ffcf4984da7a19675ed7e2f06d9e5d5188af087bf8");
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nProtocolVersion = 170120;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight = 2726400;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nProtocolVersion = 170140;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nActivationHeight = 3146400;
+        consensus.nTemporaryOrchardDisablingSoftForkHeight = 3363426;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_2].nProtocolVersion = 170150;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_2].nActivationHeight = 3364600;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nProtocolVersion = 0x7FFFFFFF;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -167,8 +174,14 @@ public:
         keyConstants.bech32HRPs[SAPLING_EXTENDED_SPEND_KEY]   = "secret-extended-key-main";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_FVK]         = "zxviews";
 
+        keyConstants.bech32mHRPs[TEX_ADDRESS]                 = "tex";
         {
-            std::vector<std::string> ecc_addresses = {
+            auto canopyActivation = consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight;
+            auto nu6Activation = consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight;
+            auto nu6_1Activation = consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nActivationHeight;
+
+            // ZIP 214 Revision 0
+            std::vector<std::string> bp_addresses = {
                 "t3LmX1cxWPPPqL4TZHx42HU3U5ghbFjRiif",
                 "t3Toxk1vJQ6UjWQ42tUJz2rV2feUWkpbTDs",
                 "t3ZBdBe4iokmsjdhMuwkxEdqMCFN16YxKe6",
@@ -227,22 +240,84 @@ public:
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_BP,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2726400,
-                ecc_addresses);
+                canopyActivation,
+                nu6Activation,
+                bp_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_ZF,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2726400,
+                canopyActivation,
+                nu6Activation,
                 zf_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_MG,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2726400,
+                canopyActivation,
+                nu6Activation,
                 mg_addresses);
+
+            // ZIP 214 Revision 1
+            // FPF uses a single address repeated 12 times, once for each funding period.
+            std::vector<std::string> fpf_addresses(12, "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow");
+
+            consensus.AddZIP207FundingStream(
+                keyConstants,
+                Consensus::FS_FPF_ZCG,
+                nu6Activation,
+                nu6_1Activation,
+                fpf_addresses);
+            consensus.AddZIP207LockboxStream(
+                keyConstants,
+                Consensus::FS_DEFERRED,
+                nu6Activation,
+                nu6_1Activation);
+
+            // ZIP 214 Revision 2
+            // FPF uses a single address repeated 36 times, once for each funding period.
+            std::vector<std::string> fpf_addresses_h3(36, "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow");
+            consensus.AddZIP207FundingStream(
+                keyConstants,
+                Consensus::FS_FPF_ZCG_H3,
+                nu6_1Activation,
+                4406400,
+                fpf_addresses_h3);
+            consensus.AddZIP207LockboxStream(
+                keyConstants,
+                Consensus::FS_CCF_H3,
+                nu6_1Activation,
+                4406400);
+
+            // ZIP 271
+            // For convenience of distribution, we split the lockbox contents into 10 equal chunks.
+            std::string nu6_1_kho_address = "t3ev37Q2uL1sfTsiJQJiWJoFzQpDhmnUwYo";
+            static const CAmount nu6_1_disbursement_amount = 78750 * COIN;
+            static const CAmount nu6_1_chunk_amount = 7875 * COIN;
+            static constexpr auto nu6_1_chunks = {
+                Consensus::LD_ZIP271_NU6_1_CHUNK_1,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_2,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_3,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_4,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_5,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_6,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_7,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_8,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_9,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_10,
+            };
+            static_assert(nu6_1_chunk_amount * nu6_1_chunks.size() == nu6_1_disbursement_amount);
+            for (auto idx : nu6_1_chunks) {
+                consensus.AddZIP271LockboxDisbursement(
+                    keyConstants,
+                    idx,
+                    Consensus::UPGRADE_NU6_1,
+                    nu6_1_chunk_amount,
+                    nu6_1_kho_address);
+            }
         }
 
         // The best chain should have at least this much work.
-        consensus.nMinimumChainWork = uint256S("0x0000000000000000000000000000000000000000000000000c7da51ec335d66c");
+        // From block 3308324, 2026-04-15.
+        consensus.nMinimumChainWork = uint256S("0x00000000000000000000000000000000000000000000000018bd77669ac52c2f");
 
         /**
          * The message start string should be awesome! ⓩ❤
@@ -251,7 +326,6 @@ public:
         pchMessageStart[1] = 0xe9;
         pchMessageStart[2] = 0x27;
         pchMessageStart[3] = 0x64;
-        vAlertPubKey = ParseHex("04b7ecf0baa90495ceb4e4090f6b2fd37eec1e9c85fac68a487f3ce11589692e4a317479316ee814e066638e1db54e37a10689b70286e6315b1087b6615d179264");
         nDefaultPort = 8233;
         nPruneAfterHeight = 100000;
 
@@ -301,10 +375,15 @@ public:
             (1400000, uint256S("0x0000000001155ecec0ad3924d47ad476c0a5ed7527b8776f53cbda1a780b9f76"))
             (1600000, uint256S("0x0000000000aae69fb228f90e77f34c24b7920667eaca726c3a3939536f03dcfc"))
             (1860000, uint256S("0x000000000043a968c78af5fb8133e00e6fe340051c19dd969e53ab62bf3dc22a"))
-            (2000000, uint256S("0x00000000010accaf2f87934765dc2e0bf4823a2b1ae2c1395b334acfce52ad68")),
-            1677602242,     // * UNIX timestamp of last checkpoint block
-            12380742,       // * total number of transactions between genesis and last checkpoint
-            7131            // * estimated number of transactions per day after checkpoint
+            (2000000, uint256S("0x00000000010accaf2f87934765dc2e0bf4823a2b1ae2c1395b334acfce52ad68"))
+            (2200000, uint256S("0x0000000001a0139c4c4d0e8f68cc562227c6003f4b1b640a3d921aeb8c3d2e3d"))
+            (2400000, uint256S("0x0000000000294d1c8d87a1b6566d302aa983691bc3cab0583a245389bbb9d285"))
+            (2600000, uint256S("0x0000000000b5ad92fcec0069d590f674d05ec7d96b1ff727863ea390950c4e49"))
+            (2800000, uint256S("0x00000000011a226fb25d778d65b055605a82da016989b7788e0ce83c4f8d64f7"))
+            (3000000, uint256S("0x0000000000573729e4db33678233e5dc0cc721c9c09977c64dcaa3f6344de8e9")),
+            1752983473,     // * UNIX timestamp of last checkpoint block
+            15537904,       // * total number of transactions between genesis and last checkpoint
+            5967            // * estimated number of transactions per day after checkpoint
                             //   (total number of tx * 48 * 24) / checkpoint block height
         };
 
@@ -315,6 +394,22 @@ public:
         nSproutValuePoolCheckpointBalance = 22145062442933;
         fZIP209Enabled = true;
         hashSproutValuePoolCheckpointBlock = uint256S("0000000000c7b46b6bc04b4cbf87d8bb08722aebd51232619b214f7273f8460e");
+
+        // Chain supply checkpoint at NU6.1 activation (height 3146400).
+        // This allows nodes with legacy block index data (written by zcashd
+        // versions older than 5.4.0, which did not serialize nChainSupplyDelta)
+        // to bootstrap nChainTotalSupply and nChainTransparentValue without
+        // requiring a reindex. The other pool balances are included so that
+        // we do not need to trust that the computed values from before the
+        // checkpoint are correct.
+        nChainSupplyCheckpointHeight = 3146400;
+        nChainSupplyCheckpointTotalSupply = 1640588297804480;
+        nChainSupplyCheckpointTransparentValue = 1158133657237751;
+        nChainSupplyCheckpointSproutValue = 2562695744028;
+        nChainSupplyCheckpointSaplingValue = 64691367655556;
+        nChainSupplyCheckpointOrchardValue = 415200558417145;
+        nChainSupplyCheckpointLockboxValue = 18750000;
+        hashChainSupplyCheckpointBlock = uint256S("0000000000b98a7d8f390793fa113bf6755935f0c14ea817af07d2c16f2c3ef4");
 
         // Founders reward script expects a vector of 2-of-3 multisig addresses
         vFoundersRewardAddress = {
@@ -432,6 +527,13 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight = 1842420;
         consensus.vUpgrades[Consensus::UPGRADE_NU5].hashActivationBlock =
             uint256S("0006d75c60b3093d1b671ff7da11c99ea535df9927c02e6ed9eb898605eb7381");
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nProtocolVersion = 170110;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight = 2976000;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nProtocolVersion = 170130;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nActivationHeight = 3536500;
+        consensus.nTemporaryOrchardDisablingSoftForkHeight = 4048500;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_2].nProtocolVersion = 170150;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_2].nActivationHeight = 4052000;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nProtocolVersion = 0x7FFFFFFF;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -460,9 +562,16 @@ public:
         keyConstants.bech32HRPs[SAPLING_EXTENDED_SPEND_KEY]   = "secret-extended-key-test";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_FVK]         = "zxviewtestsapling";
 
+        keyConstants.bech32mHRPs[TEX_ADDRESS]                 = "textest";
+
         // Testnet funding streams
         {
-            std::vector<std::string> ecc_addresses = {
+            auto canopyActivation = consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight;
+            auto nu6Activation = consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight;
+            auto nu6_1Activation = consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nActivationHeight;
+
+            // ZIP 214 Revision 0
+            std::vector<std::string> bp_addresses = {
                 "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz",
                 "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz",
                 "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz",
@@ -523,18 +632,81 @@ public:
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_BP,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2796000,
-                ecc_addresses);
+                canopyActivation,
+                2796000, // *not* the NU6 activation height
+                bp_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_ZF,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2796000,
+                canopyActivation,
+                2796000, // *not* the NU6 activation height
                 zf_addresses);
             consensus.AddZIP207FundingStream(
                 keyConstants,
                 Consensus::FS_ZIP214_MG,
-                consensus.vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight, 2796000,
+                canopyActivation,
+                2796000, // *not* the NU6 activation height
                 mg_addresses);
+
+            // ZIP 214 Revision 1
+            // FPF uses a single address repeated 13 times, once for each funding period.
+            // There are 13 periods because the start height does not align with a period boundary.
+            std::vector<std::string> fpf_addresses(13, "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu");
+            consensus.AddZIP207FundingStream(
+                keyConstants,
+                Consensus::FS_FPF_ZCG,
+                nu6Activation,
+                3396000,
+                fpf_addresses);
+            consensus.AddZIP207LockboxStream(
+                keyConstants,
+                Consensus::FS_DEFERRED,
+                nu6Activation,
+                3396000);
+
+            // ZIP 214 Revision 2
+            // FPF uses a single address repeated 27 times, once for each funding period.
+            // There are 27 periods because the start height is after the second halving
+            // on testnet and does not align with a period boundary.
+            std::vector<std::string> fpf_addresses_h3(27, "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu");
+            consensus.AddZIP207FundingStream(
+                keyConstants,
+                Consensus::FS_FPF_ZCG_H3,
+                nu6_1Activation,
+                4476000,
+                fpf_addresses_h3);
+            consensus.AddZIP207LockboxStream(
+                keyConstants,
+                Consensus::FS_CCF_H3,
+                nu6_1Activation,
+                4476000);
+
+            // ZIP 271
+            // For testing purposes, we split the lockbox contents into 10 equal chunks.
+            std::string nu6_1_kho_address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8";
+            static const CAmount nu6_1_disbursement_amount = 78750 * COIN;
+            static const CAmount nu6_1_chunk_amount = 7875 * COIN;
+            static constexpr auto nu6_1_chunks = {
+                Consensus::LD_ZIP271_NU6_1_CHUNK_1,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_2,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_3,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_4,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_5,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_6,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_7,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_8,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_9,
+                Consensus::LD_ZIP271_NU6_1_CHUNK_10,
+            };
+            static_assert(nu6_1_chunk_amount * nu6_1_chunks.size() == nu6_1_disbursement_amount);
+            for (auto idx : nu6_1_chunks) {
+                consensus.AddZIP271LockboxDisbursement(
+                    keyConstants,
+                    idx,
+                    Consensus::UPGRADE_NU6_1,
+                    nu6_1_chunk_amount,
+                    nu6_1_kho_address);
+            }
         }
 
         // On testnet we activate this rule 6 blocks after Blossom activation. From block 299188 and
@@ -561,7 +733,6 @@ public:
         pchMessageStart[1] = 0x1a;
         pchMessageStart[2] = 0xf9;
         pchMessageStart[3] = 0xbf;
-        vAlertPubKey = ParseHex("044e7a1553392325c871c5ace5d6ad73501c66f4c185d6b0453cf45dec5a1322e705c672ac1a27ef7cdaf588c10effdf50ed5f95f85f2f54a5f6159fca394ed0c6");
         nDefaultPort = 18233;
         nPruneAfterHeight = 1000;
 
@@ -605,6 +776,16 @@ public:
         nSproutValuePoolCheckpointBalance = 40000029096803;
         fZIP209Enabled = true;
         hashSproutValuePoolCheckpointBlock = uint256S("000a95d08ba5dcbabe881fc6471d11807bcca7df5f1795c99f3ec4580db4279b");
+
+        // Chain supply checkpoint at NU6.1 activation (height 3536500).
+        nChainSupplyCheckpointHeight = 3536500;
+        nChainSupplyCheckpointTotalSupply = 1690647512835043;
+        nChainSupplyCheckpointTransparentValue = 1499728640946163;
+        nChainSupplyCheckpointSproutValue = 42832983037484;
+        nChainSupplyCheckpointSaplingValue = 140562922195481;
+        nChainSupplyCheckpointOrchardValue = 7522947905915;
+        nChainSupplyCheckpointLockboxValue = 18750000;
+        hashChainSupplyCheckpointBlock = uint256S("01b947c7556b23040dc6840e9d3e4c6d9478c67a87b9737a83be848729d6e0af");
 
         // Founders reward script expects a vector of 2-of-3 multisig addresses
         vFoundersRewardAddress = {
@@ -679,6 +860,17 @@ public:
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nProtocolVersion = 170050;
         consensus.vUpgrades[Consensus::UPGRADE_NU5].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nProtocolVersion = 170110;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nProtocolVersion = 170130;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_1].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.nTemporaryOrchardDisablingSoftForkHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_2].nProtocolVersion = 170150;
+        consensus.vUpgrades[Consensus::UPGRADE_NU6_2].nActivationHeight =
+            Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nProtocolVersion = 0x7FFFFFFF;
         consensus.vUpgrades[Consensus::UPGRADE_ZFUTURE].nActivationHeight =
             Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
@@ -702,6 +894,8 @@ public:
         keyConstants.bech32HRPs[SAPLING_INCOMING_VIEWING_KEY] = "zivkregtestsapling";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_SPEND_KEY]   = "secret-extended-key-regtest";
         keyConstants.bech32HRPs[SAPLING_EXTENDED_FVK]         = "zxviewregtestsapling";
+
+        keyConstants.bech32mHRPs[TEX_ADDRESS]                 = "texregtest";
 
         // The best chain should have at least this much work.
         consensus.nMinimumChainWork = uint256S("0x00");
@@ -759,6 +953,14 @@ public:
         consensus.vFundingStreams[idx] = fs;
     }
 
+    void UpdateOnetimeLockboxDisbursementParameters(
+        Consensus::OnetimeLockboxDisbursementIndex idx,
+        Consensus::OnetimeLockboxDisbursement ld)
+    {
+        assert(idx >= Consensus::FIRST_ONETIME_LOCKBOX_DISBURSEMENT && idx < Consensus::MAX_ONETIME_LOCKBOX_DISBURSEMENTS);
+        consensus.vOnetimeLockboxDisbursements[idx] = ld;
+    }
+
     void UpdateRegtestPow(
         int64_t nPowMaxAdjustDown,
         int64_t nPowMaxAdjustUp,
@@ -771,8 +973,33 @@ public:
         consensus.fPowNoRetargeting = noRetargeting;
     }
 
+    void UpdateTemporaryOrchardDisablingSoftForkHeight(int nHeight)
+    {
+        consensus.nTemporaryOrchardDisablingSoftForkHeight = nHeight;
+    }
+
     void SetRegTestZIP209Enabled() {
         fZIP209Enabled = true;
+    }
+
+    void SetRegTestAllowLegacyChainSupplyData() {
+        fRegTestAllowLegacyChainSupplyData = true;
+    }
+
+    void SetRegTestChainSupplyCheckpoint() {
+        // Hardcoded checkpoint at height 200 (the tip of the regtest caches).
+        // The block hash is left null; FallbackChainSupplyCheckpoint
+        // skips the hash check when it is null.
+        // Values from the sprout regtest cache at height 200.
+        // The sprout cache has 4 × 50 ZEC = 200 ZEC shielded into Sprout.
+        nChainSupplyCheckpointHeight = 200;
+        nChainSupplyCheckpointTotalSupply = 214375000000;
+        nChainSupplyCheckpointTransparentValue = 194375000000;
+        nChainSupplyCheckpointSproutValue = 20000000000;
+        nChainSupplyCheckpointSaplingValue = 0;
+        nChainSupplyCheckpointOrchardValue = 0;
+        nChainSupplyCheckpointLockboxValue = 0;
+        hashChainSupplyCheckpointBlock.SetNull();
     }
 };
 static CRegTestParams regTestParams;
@@ -808,6 +1035,21 @@ void SelectParams(const std::string& network)
 
     // When a developer is debugging turnstile violations in regtest mode, enable ZIP209
     if (network == CBaseChainParams::REGTEST && mapArgs.count("-developersetpoolsizezero")) {
+        regTestParams.SetRegTestZIP209Enabled();
+    }
+
+    // Allow regtest tests that use legacy block index data (lacking nChainSupplyDelta)
+    // to skip the supply consistency check rather than aborting the node.
+    if (network == CBaseChainParams::REGTEST && mapArgs.count("-regtestallowlegacychainsupplydata")) {
+        regTestParams.SetRegTestAllowLegacyChainSupplyData();
+    }
+
+    if (network == CBaseChainParams::REGTEST && mapArgs.count("-regtestchainsupplycheckpoint")) {
+        regTestParams.SetRegTestChainSupplyCheckpoint();
+    }
+
+    // Enable ZIP 209 enforcement without zeroing shielded pool balances.
+    if (network == CBaseChainParams::REGTEST && mapArgs.count("-regtestenablezip209")) {
         regTestParams.SetRegTestZIP209Enabled();
     }
 }
@@ -861,6 +1103,13 @@ void UpdateFundingStreamParameters(Consensus::FundingStreamIndex idx, Consensus:
     regTestParams.UpdateFundingStreamParameters(idx, fs);
 }
 
+void UpdateOnetimeLockboxDisbursementParameters(
+    Consensus::OnetimeLockboxDisbursementIndex idx,
+    Consensus::OnetimeLockboxDisbursement ld)
+{
+    regTestParams.UpdateOnetimeLockboxDisbursementParameters(idx, ld);
+}
+
 void UpdateRegtestPow(
     int64_t nPowMaxAdjustDown,
     int64_t nPowMaxAdjustUp,
@@ -868,4 +1117,9 @@ void UpdateRegtestPow(
     bool noRetargeting)
 {
     regTestParams.UpdateRegtestPow(nPowMaxAdjustDown, nPowMaxAdjustUp, powLimit, noRetargeting);
+}
+
+void UpdateRegtestTemporaryOrchardDisablingSoftForkHeight(int nHeight)
+{
+    regTestParams.UpdateTemporaryOrchardDisablingSoftForkHeight(nHeight);
 }

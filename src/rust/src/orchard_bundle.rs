@@ -1,14 +1,17 @@
 use std::{mem, ptr};
 
+use group::{Group as _, GroupEncoding as _};
 use memuse::DynamicUsage;
 use orchard::{
-    bundle::Authorized,
+    bundle::{Authorized, ProofSizeEnforcement},
     keys::OutgoingViewingKey,
     note_encryption::OrchardDomain,
     primitives::redpallas::{Signature, SpendAuth},
 };
+use pasta_curves::pallas;
 use zcash_note_encryption::try_output_recovery_with_ovk;
-use zcash_primitives::transaction::components::{orchard as orchard_serialization, Amount};
+use zcash_primitives::transaction::components::orchard as orchard_serialization;
+use zcash_protocol::value::ZatBalance;
 
 use crate::{bridge::ffi, streams::CppStream};
 
@@ -49,7 +52,7 @@ impl Action {
 }
 
 #[derive(Clone)]
-pub struct Bundle(Option<orchard::Bundle<Authorized, Amount>>);
+pub struct Bundle(Option<orchard::Bundle<Authorized, ZatBalance>>);
 
 pub(crate) fn none_orchard_bundle() -> Box<Bundle> {
     Box::new(Bundle(None))
@@ -71,7 +74,7 @@ impl Bundle {
         Box::new(Bundle(if bundle.is_null() {
             None
         } else {
-            let bundle: *mut orchard::Bundle<Authorized, Amount> = bundle.cast();
+            let bundle: *mut orchard::Bundle<Authorized, ZatBalance> = bundle.cast();
             Some(*Box::from_raw(bundle))
         }))
     }
@@ -83,7 +86,16 @@ impl Bundle {
 
     /// Parses an authorized Orchard bundle from the given stream.
     pub(crate) fn parse(reader: &mut CppStream<'_>) -> Result<Box<Self>, String> {
-        match orchard_serialization::read_v5_bundle(reader) {
+        // This standalone bundle parse is deliberately lenient about the proof size
+        // (ProofSizeEnforcement::Unenforced): it has no transaction context (and hence no
+        // consensus branch id), and a node must be able to parse Orchard bundles from earlier
+        // epochs whose proofs predate the canonical-size rule.
+        //
+        // The canonical-proof-size consensus rule is instead enforced when a whole transaction
+        // is parsed (see `zcash_transaction_digests` / `Transaction::read`), where the proof
+        // size is checked against the transaction's own consensus branch id (Strict for NU6.2
+        // onward). That parse is reached for every transaction via CTransaction::UpdateHash.
+        match orchard_serialization::read_v5_bundle(reader, ProofSizeEnforcement::Unenforced) {
             Ok(parsed) => Ok(Box::new(Bundle(parsed))),
             Err(e) => Err(format!("Failed to parse Orchard bundle: {}", e)),
         }
@@ -97,13 +109,13 @@ impl Bundle {
             .map_err(|e| format!("Failed to serialize Orchard bundle: {}", e))
     }
 
-    pub(crate) fn inner(&self) -> Option<&orchard::Bundle<Authorized, Amount>> {
+    pub(crate) fn inner(&self) -> Option<&orchard::Bundle<Authorized, ZatBalance>> {
         self.0.as_ref()
     }
 
     pub(crate) fn as_ptr(&self) -> *const ffi::OrchardBundlePtr {
         if let Some(bundle) = self.inner() {
-            let ret: *const orchard::Bundle<Authorized, Amount> = bundle;
+            let ret: *const orchard::Bundle<Authorized, ZatBalance> = bundle;
             ret.cast()
         } else {
             ptr::null()
@@ -200,6 +212,31 @@ impl Bundle {
             .authorization()
             .binding_signature()
             .into()
+    }
+
+    /// Checks action fields that are not validated by the proof circuit:
+    /// - rk must not be the identity (causes a crash in proof verification)
+    /// - epk must encode a valid, non-identity Pallas curve point (consensus
+    ///   rule per protocol spec §5.4.9.4); this rejects the all-zeros identity
+    ///   encoding, non-canonical x (x >= q_P), and canonical x for which no
+    ///   curve point exists.
+    pub(crate) fn validate_action_encodings(&self) -> bool {
+        if let Some(bundle) = self.inner() {
+            for action in bundle.actions() {
+                let rk_bytes: [u8; 32] = action.rk().into();
+                if rk_bytes == [0u8; 32] {
+                    return false;
+                }
+                if pallas::Point::from_bytes(&action.encrypted_note().epk_bytes)
+                    .into_option()
+                    .into_iter()
+                    .all(|p| p.is_identity().into())
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Returns whether all actions contained in the Orchard bundle can be decrypted with

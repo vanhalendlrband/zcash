@@ -11,6 +11,8 @@
 
 #include <assert.h>
 
+#include <rust/history.h>
+
 #include <tracing.h>
 
 /**
@@ -531,9 +533,7 @@ void CCoinsViewCache::PushHistoryNode(uint32_t epochId, const HistoryNode node) 
         // special case, it just goes into the cache right away
         historyCache.Extend(node);
 
-        if (librustzcash_mmr_hash_node(epochId, &node, historyCache.root.begin()) != 0) {
-            throw std::runtime_error("hashing node failed");
-        };
+        historyCache.root = uint256::FromRawBytes(mmr::hash_node(epochId, node));
 
         return;
     }
@@ -546,27 +546,24 @@ void CCoinsViewCache::PushHistoryNode(uint32_t epochId, const HistoryNode node) 
     uint256 newRoot;
     std::array<HistoryNode, 32> appendBuf = {};
 
-    uint32_t appends = librustzcash_mmr_append(
+    auto effect = mmr::append(
         epochId,
         historyCache.length,
-        entry_indices.data(),
-        entries.data(),
-        entry_indices.size(),
-        &node,
-        newRoot.begin(),
-        appendBuf.data()
+        {entry_indices.data(), entry_indices.size()},
+        {entries.data(), entries.size()},
+        node,
+        {appendBuf.data(), 32}
     );
 
-    for (size_t i = 0; i < appends; i++) {
+    for (size_t i = 0; i < effect.count; i++) {
         historyCache.Extend(appendBuf[i]);
     }
 
-    historyCache.root = newRoot;
+    historyCache.root = uint256::FromRawBytes(effect.root);
 }
 
 void CCoinsViewCache::PopHistoryNode(uint32_t epochId) {
     HistoryCache& historyCache = SelectHistoryCache(epochId);
-    uint256 newRoot;
 
     switch (historyCache.length) {
         case 0:
@@ -602,15 +599,11 @@ void CCoinsViewCache::PopHistoryNode(uint32_t epochId) {
             // After removing a leaf from a tree with two leaves, we are left
             // with a single-node tree, whose root is just the hash of that
             // node.
-            if (librustzcash_mmr_hash_node(
+            auto newRoot = mmr::hash_node(
                 epochId,
-                &tmpHistoryRoot,
-                newRoot.begin()
-            ) != 0) {
-                throw std::runtime_error("hashing node failed");
-            }
+                tmpHistoryRoot);
             historyCache.Truncate(1);
-            historyCache.root = newRoot;
+            historyCache.root = uint256::FromRawBytes(newRoot);
             return;
         }
         default:
@@ -621,18 +614,16 @@ void CCoinsViewCache::PopHistoryNode(uint32_t epochId) {
 
             uint32_t peak_count = PreloadHistoryTree(epochId, true, entries, entry_indices);
 
-            uint32_t numberOfDeletes = librustzcash_mmr_delete(
+            auto effect = mmr::remove(
                 epochId,
                 historyCache.length,
-                entry_indices.data(),
-                entries.data(),
-                peak_count,
-                entries.size() - peak_count,
-                newRoot.begin()
+                {entry_indices.data(), entry_indices.size()},
+                {entries.data(), entries.size()},
+                peak_count
             );
 
-            historyCache.Truncate(historyCache.length - numberOfDeletes);
-            historyCache.root = newRoot;
+            historyCache.Truncate(historyCache.length - effect.count);
+            historyCache.root = uint256::FromRawBytes(effect.root);
             return;
         }
     }
@@ -1036,16 +1027,28 @@ unsigned int CCoinsViewCache::GetCacheSize() const {
     return cacheCoins.size();
 }
 
+// The returned CTxOut has nValue in MoneyRange. This is guaranteed by
+// CheckTransaction for outputs that entered the UTXO set through normal
+// block connection, and re-validated here to defend against on-disk
+// corruption of the chainstate database.
 const CTxOut &CCoinsViewCache::GetOutputFor(const CTxIn& input) const
 {
     const CCoins* coins = AccessCoins(input.prevout.hash);
     assert(coins && coins->IsAvailable(input.prevout.n));
-    return coins->vout[input.prevout.n];
+    const CTxOut& out = coins->vout[input.prevout.n];
+    if (!MoneyRange(out.nValue)) {
+        throw std::runtime_error("CCoinsViewCache::GetOutputFor(): output value out of range");
+    }
+    return out;
 }
 
 CAmount CCoinsViewCache::GetValueIn(const CTransaction& tx) const
 {
-    return GetTransparentValueIn(tx) + tx.GetShieldedValueIn();
+    CAmount nResult = GetTransparentValueIn(tx) + tx.GetShieldedValueIn();
+    if (!MoneyRange(nResult)) {
+        throw std::runtime_error("CCoinsViewCache::GetValueIn(): nResult out of range");
+    }
+    return nResult;
 }
 
 CAmount CCoinsViewCache::GetTransparentValueIn(const CTransaction& tx) const
@@ -1054,8 +1057,12 @@ CAmount CCoinsViewCache::GetTransparentValueIn(const CTransaction& tx) const
         return 0;
 
     CAmount nResult = 0;
-    for (unsigned int i = 0; i < tx.vin.size(); i++)
+    for (unsigned int i = 0; i < tx.vin.size(); i++) {
         nResult += GetOutputFor(tx.vin[i]).nValue;
+        if (!MoneyRange(nResult)) {
+            throw std::runtime_error("CCoinsViewCache::GetTransparentValueIn(): nResult out of range");
+        }
+    }
 
     return nResult;
 }

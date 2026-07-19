@@ -6,8 +6,8 @@ use incrementalmerkletree::Hashable;
 use libc::size_t;
 use orchard::keys::SpendingKey;
 use orchard::{
-    builder::{Builder, InProgress, Unauthorized, Unproven},
-    bundle::{Authorized, Flags},
+    builder::{Builder, BundleType, InProgress, Unauthorized, Unproven},
+    bundle::Authorized,
     keys::{FullViewingKey, OutgoingViewingKey},
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
@@ -15,21 +15,32 @@ use orchard::{
 };
 use rand_core::OsRng;
 use tracing::error;
-use zcash_primitives::{
-    consensus::BranchId,
-    transaction::{
-        components::{sapling, Amount},
-        sighash::{signature_hash, SignableInput},
-        txid::TxIdDigester,
-        Authorization, Transaction, TransactionData,
-    },
+use zcash_primitives::transaction::{
+    sighash::{signature_hash, SignableInput},
+    txid::TxIdDigester,
+    Authorization, Transaction, TransactionData,
 };
+use zcash_protocol::{consensus::BranchId, memo::MemoBytes, value::ZatBalance};
 
 use crate::{
     bridge::ffi::OrchardUnauthorizedBundlePtr,
     transaction_ffi::{MapTransparent, TransparentAuth},
-    ORCHARD_PK,
+    ORCHARD_PK, ORCHARD_PK_INSECURE,
 };
+
+use orchard::circuit::OrchardCircuitVersion;
+
+// Maps the caller's "use the fixed circuit?" decision (C++ `CChainParams::UseFixedCircuitForProving`) to
+// an Orchard circuit version. `true` selects the fixed (NU6.2-onward) circuit; `false` selects
+// the historical insecure circuit, which the caller only chooses pre-NU6.2 on regtest, so that
+// tests can reconstruct pre-NU6.2 Orchard history.
+fn circuit_version_for(use_fixed_circuit_for_proving: bool) -> OrchardCircuitVersion {
+    if use_fixed_circuit_for_proving {
+        OrchardCircuitVersion::FixedPostNu6_2
+    } else {
+        OrchardCircuitVersion::InsecurePreNu6_2
+    }
+}
 
 pub struct OrchardSpendInfo {
     fvk: FullViewingKey,
@@ -56,16 +67,24 @@ pub extern "C" fn orchard_spend_info_free(spend_info: *mut OrchardSpendInfo) {
 
 #[no_mangle]
 pub extern "C" fn orchard_builder_new(
-    spends_enabled: bool,
-    outputs_enabled: bool,
+    coinbase: bool,
     anchor: *const [u8; 32],
+    use_fixed_circuit_for_proving: bool,
 ) -> *mut Builder {
+    let bundle_type = if coinbase {
+        BundleType::Coinbase
+    } else {
+        BundleType::DEFAULT
+    };
     let anchor = unsafe { anchor.as_ref() }
         .map(|a| orchard::Anchor::from_bytes(*a).unwrap())
         .unwrap_or_else(|| MerkleHashOrchard::empty_root(32.into()).into());
-    Box::into_raw(Box::new(Builder::new(
-        Flags::from_parts(spends_enabled, outputs_enabled),
+    // The builder stamps this circuit version onto each action's circuit; the proving key
+    // passed to `orchard_unauthorized_bundle_prove_and_sign` must match.
+    Box::into_raw(Box::new(Builder::new_for_version(
+        bundle_type,
         anchor,
+        circuit_version_for(use_fixed_circuit_for_proving),
     )))
 }
 
@@ -106,7 +125,12 @@ pub extern "C" fn orchard_builder_add_recipient(
     let value = NoteValue::from_raw(value);
     let memo = unsafe { memo.as_ref() }.copied();
 
-    match builder.add_recipient(ovk, *recipient, value, memo) {
+    match builder.add_output(
+        ovk,
+        *recipient,
+        value,
+        memo.unwrap_or(MemoBytes::empty().into_bytes()),
+    ) {
         Ok(()) => true,
         Err(e) => {
             error!("Failed to add Orchard recipient: {}", e);
@@ -125,15 +149,22 @@ pub extern "C" fn orchard_builder_free(builder: *mut Builder) {
 #[no_mangle]
 pub extern "C" fn orchard_builder_build(
     builder: *mut Builder,
-) -> *mut Bundle<InProgress<Unproven, Unauthorized>, Amount> {
+) -> *mut Bundle<InProgress<Unproven, Unauthorized>, ZatBalance> {
     if builder.is_null() {
         error!("Called with null builder");
         return ptr::null_mut();
     }
     let builder = unsafe { Box::from_raw(builder) };
 
-    match builder.build(OsRng) {
-        Ok(bundle) => Box::into_raw(Box::new(bundle)),
+    match builder.build::<ZatBalance>(OsRng) {
+        Ok(Some((bundle, _))) => Box::into_raw(Box::new(bundle)),
+        Ok(None) => {
+            // The C++ side only calls `orchard_builder_build` when it expects the
+            // resulting bundle to be non-empty (either at least one Orchard output for
+            // coinbase transactions, or a potentially-empty bundle that gets padded).
+            error!("Tried to build empty Orchard bundle");
+            ptr::null_mut()
+        }
         Err(e) => {
             error!("Failed to build Orchard bundle: {:?}", e);
             ptr::null_mut()
@@ -143,7 +174,7 @@ pub extern "C" fn orchard_builder_build(
 
 #[no_mangle]
 pub extern "C" fn orchard_unauthorized_bundle_free(
-    bundle: *mut Bundle<InProgress<Unproven, Unauthorized>, Amount>,
+    bundle: *mut Bundle<InProgress<Unproven, Unauthorized>, ZatBalance>,
 ) {
     if !bundle.is_null() {
         drop(unsafe { Box::from_raw(bundle) });
@@ -152,16 +183,14 @@ pub extern "C" fn orchard_unauthorized_bundle_free(
 
 #[no_mangle]
 pub extern "C" fn orchard_unauthorized_bundle_prove_and_sign(
-    bundle: *mut Bundle<InProgress<Unproven, Unauthorized>, Amount>,
+    bundle: *mut Bundle<InProgress<Unproven, Unauthorized>, ZatBalance>,
     keys: *const *const SpendingKey,
     keys_len: size_t,
     sighash: *const [u8; 32],
-) -> *mut Bundle<Authorized, Amount> {
+) -> *mut Bundle<Authorized, ZatBalance> {
     let bundle = unsafe { Box::from_raw(bundle) };
     let keys = unsafe { slice::from_raw_parts(keys, keys_len) };
     let sighash = unsafe { sighash.as_ref() }.expect("sighash pointer may not be null.");
-    let pk = unsafe { ORCHARD_PK.as_ref() }
-        .expect("Parameters not loaded: ORCHARD_PK should have been initialized");
 
     let signing_keys = keys
         .iter()
@@ -173,9 +202,23 @@ pub extern "C" fn orchard_unauthorized_bundle_prove_and_sign(
         .collect::<Vec<_>>();
 
     let mut rng = OsRng;
-    let res = bundle
-        .create_proof(pk, &mut rng)
-        .and_then(|b| b.apply_signatures(rng, *sighash, &signing_keys));
+    // Prove against the key for the circuit version the bundle was built for (chosen in
+    // `orchard_builder_new`), which the bundle carries: the fixed circuit (`ORCHARD_PK`), or
+    // the historical insecure circuit (`ORCHARD_PK_INSECURE`, reached only pre-NU6.2 on
+    // regtest). Reading the version from the bundle keeps it the single source of truth, so the
+    // proving key cannot disagree with the circuit the actions were built against.
+    let proof = match bundle.circuit_version() {
+        OrchardCircuitVersion::FixedPostNu6_2 => bundle.create_proof(
+            ORCHARD_PK
+                .get()
+                .expect("Parameters not loaded: ORCHARD_PK should have been initialized"),
+            &mut rng,
+        ),
+        OrchardCircuitVersion::InsecurePreNu6_2 => {
+            bundle.create_proof(&ORCHARD_PK_INSECURE, &mut rng)
+        }
+    };
+    let res = proof.and_then(|b| b.apply_signatures(rng, *sighash, &signing_keys));
 
     match res {
         Ok(signed) => Box::into_raw(Box::new(signed)),
@@ -224,7 +267,7 @@ pub(crate) fn shielded_signature_digest(
     let f_transparent = MapTransparent::parse(all_prev_outputs, &tx)?;
     let orchard_bundle = unsafe {
         orchard_bundle
-            .cast::<Bundle<InProgress<Unproven, Unauthorized>, Amount>>()
+            .cast::<Bundle<InProgress<Unproven, Unauthorized>, ZatBalance>>()
             .as_ref()
     };
 
@@ -232,7 +275,8 @@ pub(crate) fn shielded_signature_digest(
     struct Signable {}
     impl Authorization for Signable {
         type TransparentAuth = TransparentAuth;
-        type SaplingAuth = sapling::builder::Unauthorized;
+        type SaplingAuth =
+            sapling::builder::InProgress<sapling::builder::Proven, sapling::builder::Unsigned>;
         type OrchardAuth = InProgress<Unproven, Unauthorized>;
     }
 

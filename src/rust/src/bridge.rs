@@ -70,6 +70,7 @@ pub(crate) mod ffi {
     extern "Rust" {
         type Network;
 
+        #[allow(clippy::too_many_arguments)]
         fn network(
             network: &str,
             overwinter: i32,
@@ -78,6 +79,9 @@ pub(crate) mod ffi {
             heartwood: i32,
             canopy: i32,
             nu5: i32,
+            nu6: i32,
+            nu6_1: i32,
+            nu6_2: i32,
         ) -> Result<Box<Network>>;
     }
 
@@ -185,11 +189,15 @@ pub(crate) mod ffi {
         type SaplingBuilder;
 
         #[cxx_name = "new_builder"]
-        fn new_sapling_builder(network: &Network, height: u32) -> Box<SaplingBuilder>;
+        fn new_sapling_builder(
+            network: &Network,
+            height: u32,
+            anchor: [u8; 32],
+            coinbase: bool,
+        ) -> Result<Box<SaplingBuilder>>;
         fn add_spend(
             self: &mut SaplingBuilder,
             extsk: &[u8],
-            diversifier: [u8; 11],
             recipient: [u8; 43],
             value: u64,
             rcm: [u8; 32],
@@ -205,7 +213,6 @@ pub(crate) mod ffi {
         #[cxx_name = "build_bundle"]
         fn build_sapling_bundle(
             builder: Box<SaplingBuilder>,
-            target_height: u32,
         ) -> Result<Box<SaplingUnauthorizedBundle>>;
 
         #[cxx_name = "UnauthorizedBundle"]
@@ -294,6 +301,7 @@ pub(crate) mod ffi {
         fn anchor(self: &Bundle) -> [u8; 32];
         fn proof(self: &Bundle) -> Vec<u8>;
         fn binding_sig(self: &Bundle) -> [u8; 64];
+        fn validate_action_encodings(self: &Bundle) -> bool;
         fn coinbase_outputs_are_valid(self: &Bundle) -> bool;
     }
 
@@ -302,7 +310,10 @@ pub(crate) mod ffi {
         #[cxx_name = "BatchValidator"]
         type OrchardBatchValidator;
         #[cxx_name = "init_batch_validator"]
-        fn orchard_batch_validation_init(cache_store: bool) -> Box<OrchardBatchValidator>;
+        fn orchard_batch_validation_init(
+            cache_store: bool,
+            nu6_2_active: bool,
+        ) -> Box<OrchardBatchValidator>;
         fn add_bundle(self: &mut OrchardBatchValidator, bundle: Box<Bundle>, sighash: [u8; 32]);
         fn validate(self: &mut OrchardBatchValidator) -> bool;
     }

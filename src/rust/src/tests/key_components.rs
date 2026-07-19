@@ -1,13 +1,10 @@
 use group::GroupEncoding;
-use zcash_primitives::{
-    constants::SPENDING_KEY_GENERATOR,
-    sapling::{Diversifier, Nullifier, ProofGenerationKey, Rseed},
+use sapling::{
+    constants::SPENDING_KEY_GENERATOR, keys::SpendValidatingKey, value::NoteValue, Diversifier,
+    Nullifier, ProofGenerationKey, Rseed,
 };
 
-use crate::{
-    librustzcash_ask_to_ak, librustzcash_check_diversifier, librustzcash_crh_ivk,
-    librustzcash_ivk_to_pkd, librustzcash_nsk_to_nk,
-};
+use crate::sapling::spec::{ask_to_ak, check_diversifier, crh_ivk, ivk_to_pkd, nsk_to_nk};
 
 #[test]
 fn key_components() {
@@ -660,40 +657,39 @@ fn key_components() {
         let ak = SPENDING_KEY_GENERATOR * ask;
         assert_eq!(&ak.to_bytes(), &tv.ak);
         {
-            let mut ak = [0u8; 32];
-            librustzcash_ask_to_ak(&tv.ask, &mut ak);
+            let ak = ask_to_ak(&tv.ask);
             assert_eq!(&ak, &tv.ak);
         }
 
-        let pgk = ProofGenerationKey { ak, nsk };
+        let pgk = ProofGenerationKey {
+            ak: SpendValidatingKey::temporary_zcash_from_bytes(&ak.to_bytes()).unwrap(),
+            nsk,
+        };
         let fvk = pgk.to_viewing_key();
         assert_eq!(&fvk.nk.0.to_bytes(), &tv.nk);
         {
-            let mut nk = [0u8; 32];
-            librustzcash_nsk_to_nk(&tv.nsk, &mut nk);
+            let nk = nsk_to_nk(&tv.nsk);
             assert_eq!(&nk, &tv.nk);
         }
 
         assert_eq!(&fvk.ivk().to_repr(), &tv.ivk);
         {
-            let mut ivk = [0u8; 32];
-            librustzcash_crh_ivk(&tv.ak, &tv.nk, &mut ivk);
+            let ivk = crh_ivk(&tv.ak, &tv.nk);
             assert_eq!(&ivk, &tv.ivk);
         }
 
         let diversifier = Diversifier(tv.default_d);
-        assert!(librustzcash_check_diversifier(&tv.default_d));
+        assert!(check_diversifier(tv.default_d));
 
         let addr = fvk.to_payment_address(diversifier).unwrap();
         assert_eq!(&addr.to_bytes()[11..], &tv.default_pk_d);
         {
-            let mut default_pk_d = [0u8; 32];
-            librustzcash_ivk_to_pkd(&tv.ivk, &tv.default_d, &mut default_pk_d);
+            let default_pk_d = ivk_to_pkd(&tv.ivk, tv.default_d).unwrap();
             assert_eq!(&default_pk_d, &tv.default_pk_d);
         }
 
         let note_r = jubjub::Scalar::from_bytes(&tv.note_r).unwrap();
-        let note = addr.create_note(tv.note_v, Rseed::BeforeZip212(note_r));
+        let note = addr.create_note(NoteValue::from_raw(tv.note_v), Rseed::BeforeZip212(note_r));
         assert_eq!(&note.cmu().to_bytes(), &tv.note_cm);
 
         assert_eq!(note.nf(&fvk.nk, tv.note_pos), Nullifier(tv.note_nf));

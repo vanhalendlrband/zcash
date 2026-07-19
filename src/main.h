@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2014 The Bitcoin Core developers
-// Copyright (c) 2016-2023 The Zcash developers
+// Copyright (c) 2016-2025 The Zcash developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php .
 
@@ -60,8 +60,6 @@ class PrecomputedTransactionData;
 
 struct CNodeStateStats;
 
-/** Default for accepting alerts from the P2P network. */
-static const bool DEFAULT_ALERTS = true;
 /** Maximum reorg length we will accept before we shut down and alert the user. */
 static const unsigned int MAX_REORG_LENGTH = COINBASE_MATURITY - 1;
 /** Default for DEFAULT_WHITELISTRELAY. */
@@ -80,6 +78,10 @@ static const CAmount HIGH_MAX_TX_FEE = 100 * HIGH_TX_FEE_PER_KB;
 static const unsigned int LOW_LOGICAL_ACTIONS = 10;
 /** Default for -maxorphantx, maximum number of orphan transactions kept in memory */
 static const unsigned int DEFAULT_MAX_ORPHAN_TRANSACTIONS = 100;
+/** Expiration time for orphan transactions in seconds */
+static const int64_t ORPHAN_TX_EXPIRE_TIME = 20 * 60;
+/** Minimum time between orphan transactions expire time checks in seconds */
+static const int64_t ORPHAN_TX_EXPIRE_INTERVAL = 5 * 60;
 /** Default for -limitancestorcount, max number of in-mempool ancestors */
 static const unsigned int DEFAULT_ANCESTOR_LIMIT = 100;
 /** Default for -limitancestorsize, maximum kilobytes of tx + all in-mempool ancestors */
@@ -216,8 +218,6 @@ extern CFeeRate minRelayTxFee;
 extern CAmount maxTxFee;
 /** Limit on the number of unpaid actions a transaction can have to be accepted to the mempool. */
 extern CAmount nTxUnpaidActionLimit;
-/** Whether alert messages are processed. */
-extern bool fAlerts;
 /** If the tip is older than this (in seconds), the node is considered to be in initial block download. */
 extern int64_t nMaxTipAge;
 
@@ -241,7 +241,7 @@ static const signed int DEFAULT_CHECKBLOCKS = MIN_BLOCKS_TO_KEEP;
 static const unsigned int DEFAULT_CHECKLEVEL = 3;
 
 /** Prefer to create v4 transactions. */
-static const int32_t DEFAULT_PREFERRED_TX_VERSION = SAPLING_TX_VERSION;
+static const int32_t DEFAULT_PREFERRED_TX_VERSION = ZIP225_TX_VERSION;
 static const std::set<int32_t> SUPPORTED_TX_VERSIONS = { SAPLING_TX_VERSION, ZIP225_TX_VERSION };
 extern int32_t nPreferredTxVersion;
 
@@ -307,7 +307,7 @@ bool TestSetIBD(bool);
 /** Format a string that describes several potential problems detected by the core */
 std::pair<std::string, int64_t> GetWarnings(const std::string& strFor);
 /** Retrieve a transaction (from memory pool, or from disk, if possible) */
-bool GetTransaction(const uint256& hash, CTransaction& tx, const Consensus::Params& params, uint256& hashBlock, bool fAllowSlow = false, CBlockIndex* blockIndex = nullptr);
+bool GetTransaction(const uint256& hash, CTransaction& tx, const Consensus::Params& params, uint256& hashBlock, bool fAllowSlow = false, const CBlockIndex* blockIndex = nullptr);
 /** Find the best known block, and make it the tip of the block chain */
 bool ActivateBestChain(CValidationState& state, const CChainParams& chainparams, const CBlock* pblock = NULL);
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams);
@@ -596,10 +596,12 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
                   bool fJustCheck = false, CheckAs blockChecks = CheckAs::Block);
 
 /**
- * Check a block is completely valid from start to finish (only works on top
- * of our current best block, with cs_main held)
+ * Check that a block is completely valid from start to finish, as if it were
+ * appended to the current chain tip. Must be called with `cs_main` held. The
+ * block must build directly on the active tip; this is asserted internally
+ * via `block.hashPrevBlock == chainActive.Tip()->GetBlockHash()`.
  */
-bool TestBlockValidity(CValidationState& state, const CChainParams& chainparams, const CBlock& block, CBlockIndex* pindexPrev, bool fIsBlockTemplate);
+bool TestNewBlockAtTipValidity(CValidationState& state, const CChainParams& chainparams, const CBlock& block, bool fIsBlockTemplate);
 
 /**
  * This will clear the subtree database for a given shielded type from the

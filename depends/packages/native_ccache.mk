@@ -1,15 +1,20 @@
 package=native_ccache
-$(package)_version=4.8.2
+$(package)_version=4.12.3
 $(package)_download_path=https://github.com/ccache/ccache/releases/download/v$($(package)_version)
 $(package)_file_name=ccache-$($(package)_version).tar.gz
-$(package)_sha256_hash=75eef15b8b9da48db9c91e1d0ff58b3645fc70c0e4ca2ef1b6825a12f21f217d
+$(package)_sha256_hash=d683d5964a395f00c1c812ea1d1d523179f1097cbff7e7e54e714fa3f99711b1
 $(package)_build_subdir=build
-$(package)_dependencies=native_cmake native_zstd
+$(package)_dependencies=native_cmake native_fmt native_xxhash native_zstd
 
 define $(package)_set_vars
 $(package)_config_opts += -DCMAKE_BUILD_TYPE=Release
+$(package)_config_opts += -DDEPS=LOCAL
+$(package)_config_opts += -DCMAKE_PREFIX_PATH=$(build_prefix)
+$(package)_config_opts += -DFMT_LIBRARY=$(build_prefix)/lib/libfmt.a
+$(package)_config_opts += -DXXHASH_LIBRARY=$(build_prefix)/lib/libxxhash.a
 $(package)_config_opts += -DZSTD_LIBRARY=$(build_prefix)/lib/libzstd.a
 $(package)_config_opts += -DREDIS_STORAGE_BACKEND=OFF
+$(package)_config_opts += -DENABLE_TESTING=OFF
 endef
 
 define $(package)_preprocess_cmds

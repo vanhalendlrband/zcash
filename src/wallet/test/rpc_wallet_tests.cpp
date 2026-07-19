@@ -315,8 +315,27 @@ BOOST_AUTO_TEST_CASE(rpc_wallet)
         }
     };
 
+    auto check_lockbox_streams = [](UniValue obj, std::vector<std::string> recipients, std::vector<double> amounts) {
+        size_t n = recipients.size();
+        BOOST_REQUIRE_EQUAL(amounts.size(), n);
+        UniValue lockboxstreams = find_value(obj, "lockboxstreams");
+        BOOST_CHECK_EQUAL(lockboxstreams.size(), n);
+        if (lockboxstreams.size() != n) return;
+
+        for (int i = 0; i < n; i++) {
+            UniValue fsobj = lockboxstreams[i];
+            BOOST_CHECK_EQUAL(find_value(fsobj, "recipient").get_str(), recipients[i]);
+            BOOST_CHECK_EQUAL(find_value(fsobj, "specification").get_str(), "https://zips.z.cash/zip-0214");
+            BOOST_CHECK_EQUAL(find_value(fsobj, "value").get_real(), amounts[i]);
+        }
+    };
+
     bool canopyEnabled =
         Params().GetConsensus().vUpgrades[Consensus::UPGRADE_CANOPY].nActivationHeight != Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+    bool nu6Enabled =
+        Params().GetConsensus().vUpgrades[Consensus::UPGRADE_NU6].nActivationHeight != Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
+    bool nu6_1Enabled =
+        Params().GetConsensus().vUpgrades[Consensus::UPGRADE_NU6_1].nActivationHeight != Consensus::NetworkUpgrade::NO_ACTIVATION_HEIGHT;
 
     // slow start + blossom activation + (pre blossom halving - blossom activation) * 2
     BOOST_CHECK_NO_THROW(retValue = CallRPC("getblocksubsidy 1046400"));
@@ -332,6 +351,7 @@ BOOST_AUTO_TEST_CASE(rpc_wallet)
                                        "t3XyYW8yBFRuMnfvm5KLGFbEVz25kckZXym"
                                    });
     }
+    BOOST_CHECK(find_value(obj, "lockboxstreams").empty());
 
     BOOST_CHECK_NO_THROW(retValue = CallRPC("getblocksubsidy 2726399"));
     obj = retValue.get_obj();
@@ -346,10 +366,45 @@ BOOST_AUTO_TEST_CASE(rpc_wallet)
                                        "t3XyYW8yBFRuMnfvm5KLGFbEVz25kckZXym"
                                    });
     }
+    BOOST_CHECK(find_value(obj, "lockboxstreams").empty());
 
     BOOST_CHECK_NO_THROW(retValue = CallRPC("getblocksubsidy 2726400"));
     obj = retValue.get_obj();
-    BOOST_CHECK_EQUAL(find_value(obj, "miner").get_real(), 1.5625);
+    BOOST_CHECK_EQUAL(find_value(obj, "miner").get_real(), nu6Enabled ? 1.25 : 1.5625);
+    BOOST_CHECK_EQUAL(find_value(obj, "founders").get_real(), 0.0);
+    if (nu6Enabled) {
+        check_funding_streams(obj, { "Zcash Community Grants NU6" },
+                                   { 0.125,                       },
+                                   {
+                                       "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+                                   });
+        check_lockbox_streams(obj, { "Lockbox NU6" },
+                                   { 0.1875,       });
+    } else {
+        BOOST_CHECK(find_value(obj, "fundingstreams").empty());
+        BOOST_CHECK(find_value(obj, "lockboxstreams").empty());
+    }
+
+    BOOST_CHECK_NO_THROW(retValue = CallRPC("getblocksubsidy 3146400"));
+    obj = retValue.get_obj();
+    BOOST_CHECK_EQUAL(find_value(obj, "miner").get_real(), nu6_1Enabled ? 1.25 : 1.5625);
+    BOOST_CHECK_EQUAL(find_value(obj, "founders").get_real(), 0.0);
+    if (nu6_1Enabled) {
+        check_funding_streams(obj, { "Zcash Community Grants to third halving" },
+                                   { 0.125,                       },
+                                   {
+                                       "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+                                   });
+        check_lockbox_streams(obj, { "Coinholder-Controlled Fund to third halving" },
+                                   { 0.1875,       });
+    } else {
+        BOOST_CHECK(find_value(obj, "fundingstreams").empty());
+        BOOST_CHECK(find_value(obj, "lockboxstreams").empty());
+    }
+
+    BOOST_CHECK_NO_THROW(retValue = CallRPC("getblocksubsidy 4406400"));
+    obj = retValue.get_obj();
+    BOOST_CHECK_EQUAL(find_value(obj, "miner").get_real(), 0.78125);
     BOOST_CHECK_EQUAL(find_value(obj, "founders").get_real(), 0.0);
     BOOST_CHECK(find_value(obj, "fundingstreams").empty());
 
@@ -691,7 +746,7 @@ BOOST_AUTO_TEST_CASE(rpc_wallet_z_importexport)
         BOOST_CHECK_EQUAL(retValue.get_str(), testKey);
 
         // create a random Sapling key locally; split between IVKs and spending keys.
-        auto testSaplingSpendingKey = m.Derive(i);
+        auto testSaplingSpendingKey = m.Derive(i | HARDENED_KEY_LIMIT);
         auto testSaplingPaymentAddress = testSaplingSpendingKey.ToXFVK().DefaultAddress();
         if (i % 2 == 0) {
             std::string testSaplingAddr = keyIO.EncodePaymentAddress(testSaplingPaymentAddress);
@@ -1204,7 +1259,7 @@ BOOST_AUTO_TEST_CASE(rpc_z_sendmany_parameters)
     // Mutable tx containing contextual information we need to build tx
     UniValue retValue = CallRPC("getblockcount");
     int nHeight = retValue.get_int();
-    TransactionBuilder builder(Params(), nHeight + 1, std::nullopt, pwalletMain);
+    TransactionBuilder builder(Params(), nHeight + 1, std::nullopt, SaplingMerkleTree::empty_root(), pwalletMain);
 }
 
 BOOST_AUTO_TEST_CASE(asyncrpcoperation_sign_send_raw_transaction) {
@@ -1627,7 +1682,7 @@ BOOST_AUTO_TEST_CASE(rpc_z_mergetoaddress_parameters)
             TransparentCoinbasePolicy::Disallow);
     TransactionStrategy strategy(PrivacyPolicy::AllowRevealedRecipients);
 
-    builder.PrepareTransaction(*pwalletMain, selector, {}, testnetzaddr, chainActive, strategy, -1, 1)
+    (void)builder.PrepareTransaction(*pwalletMain, selector, {}, testnetzaddr, chainActive, strategy, -1, 1)
         .map_error([&](const auto& err) {
             // TODO: Provide `operator==` on `InputSelectionError` and use that here.
             BOOST_CHECK(std::holds_alternative<InvalidFeeError>(err));
@@ -1636,7 +1691,7 @@ BOOST_AUTO_TEST_CASE(rpc_z_mergetoaddress_parameters)
             BOOST_FAIL("Fee value of -1 expected to be out of the valid range of values.");
         });
 
-    builder.PrepareTransaction(*pwalletMain, selector, {}, testnetzaddr, chainActive, strategy, 1, 1)
+    (void)builder.PrepareTransaction(*pwalletMain, selector, {}, testnetzaddr, chainActive, strategy, 1, 1)
         .map_error([&](const auto& err) {
             // TODO: Provide `operator==` on `InputSelectionError` and use that here.
             BOOST_CHECK(examine(err, match {

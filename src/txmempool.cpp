@@ -133,7 +133,7 @@ void CTxMemPool::UpdateTransactionsFromBlock(const std::vector<uint256> &vHashes
     // accounted for in the state of their ancestors)
     std::set<uint256> setAlreadyIncluded(vHashesToUpdate.begin(), vHashesToUpdate.end());
 
-    // Iterate in reverse, so that whenever we are looking at at a transaction
+    // Iterate in reverse, so that whenever we are looking at a transaction
     // we are sure that all in-mempool descendants have already been processed.
     // This maximizes the benefit of the descendant cache and guarantees that
     // setMemPoolChildren will be updated, an assumption made in
@@ -839,6 +839,28 @@ void CTxMemPool::removeWithoutBranchId(uint32_t nMemPoolBranchId)
     for (indexed_transaction_set::const_iterator it = mapTx.begin(); it != mapTx.end(); it++) {
         const CTransaction& tx = it->GetTx();
         if (it->GetValidatedBranchId() != nMemPoolBranchId) {
+            transactionsToRemove.push_back(tx);
+        }
+    }
+
+    for (const CTransaction& tx : transactionsToRemove) {
+        std::list<CTransaction> removed;
+        remove(tx, removed, true);
+    }
+}
+
+/**
+ * Called when the block prior to the disable-Orchard soft fork is connected.
+ * Removes transactions which contain Orchard actions from the mempool.
+ */
+void CTxMemPool::removeContainingOrchard()
+{
+    LOCK(cs);
+    std::list<CTransaction> transactionsToRemove;
+
+    for (indexed_transaction_set::const_iterator it = mapTx.begin(); it != mapTx.end(); it++) {
+        const CTransaction& tx = it->GetTx();
+        if (tx.GetOrchardBundle().IsPresent()) {
             transactionsToRemove.push_back(tx);
         }
     }

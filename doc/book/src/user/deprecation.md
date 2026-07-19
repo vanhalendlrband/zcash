@@ -1,6 +1,12 @@
 Deprecated Features
 ===================
 
+> **Note:** `zcashd` is [deprecated](end-of-life.md) and does not support
+> NU6.3; the automatic End-of-Support halt was reached on July 18th 2026 at block height
+> 3417100, and every `zcashd` 6.20.0 node has now shut down (NU6.3 mainnet activation
+> follows around July 28th). See the [End of Life](end-of-life.md) page for migration
+> guidance to Zebra and Zallet.
+
 In order to support the continuous improvement of `zcashd`, features are
 periodically deprecated and removed when they have been superseded or are no
 longer useful.  Deprecation follows a 3-stage process:
@@ -11,7 +17,7 @@ longer useful.  Deprecation follows a 3-stage process:
    stage remain enabled by default, they may be explicitly disabled by
    specifying `-allowdeprecated=none` on the command line when starting the
    node, or by including `allowdeprecated=none` as a line in the `zcash.conf`
-   file. 
+   file.
 2. In the next stage of deprecation, the feature will be disabled by default.
    Disabled features may be reenabled via use of the `-allowdeprecated` flag.
 3. In the third stage, the feature is fully removed and is no longer available.
@@ -23,7 +29,7 @@ features will only be fully removed after a total of at least 6 minor-version up
 version every 6 weeks, so deprecated features remain accessible by default for
 approximately 18 weeks, and then can be expected to be removed no less than 36
 weeks after their initial deprecation. Deprecation and removal timelines might
-be extended beyond this on a case-by-case basis to satisfy user requirements. 
+be extended beyond this on a case-by-case basis to satisfy user requirements.
 
 Currently Deprecated
 ====================
@@ -37,10 +43,19 @@ the node, or if an `allowdeprecated=none` line is added to `zcash.conf`.
 
 | `feature`                           | Deprecated | Feature details
 |-------------------------------------|------------|----------------
-| `z_getbalance`                      | 5.0.0      | The `z_getbalance` RPC method.
 | `z_gettotalbalance`                 | 5.0.0      | The `z_gettotalbalance` RPC method.
-| `gbt_oldhashes`                     | 5.4.0      | The `finalsaplingroothash`, `lightclientroothash`, and `blockcommitmentshash` fields in the output of `getblocktemplate`, which are replaced by the `defaultroots` field.
-| `deprecationinfo_deprecationheight` | 5.5.0      | The `deprecationheight` field returned by the `getdeprecationinfo` RPC method has been replaced by the `end_of_service` object.
+| `createrawtransaction`              | 6.2.0      | The `createrawtransaction` RPC method.
+| `fundrawtransaction`                | 6.2.0      | The `fundrawtransaction` RPC method.
+| `signrawtransaction`                | 6.2.0      | The `signrawtransactions` RPC method.
+| `keypoolrefill`                     | 6.2.0      | The `keypoolrefill` RPC method.
+| `settxfee`                          | 6.2.0      | The `settxfee` RPC method.
+
+The `createrawtransaction`, `fundrawtransaction`, and `signrawtransaction` RPC methods are intended to be replaced
+by PCZT-based functionality implemented in Zallet [zcash/wallet#99](https://github.com/zcash/wallet/issues/99).
+
+The experimental RPC methods `z_getpaymentdisclosure` and `z_validatepaymentdisclosure` (which only supported
+Sprout) are also deprecated.
+
 
 Stage 2
 -------
@@ -49,12 +64,18 @@ Each feature in the table below may be enabled by adding `-allowdeprecated=<feat
 to the CLI arguments when starting the node, or by adding an `allowdeprecated=<feature>`
 line to `zcash.conf`.
 
-| `feature`             | Deprecated | Feature details
-|-----------------------|------------|----------------
-| `legacy_privacy`      | 5.0.0      | The default "legacy" privacy policy for `z_sendmany` has been replaced by the `FullPrivacy` directive.
-| `getnewaddress`       | 5.0.0      | The `getnewaddress` RPC method.
-| `getrawchangeaddress` | 5.0.0      | The `getrawchangeaddress` RPC method.
-| `z_getnewaddress`     | 5.0.0      | The `z_getnewaddress` RPC method.
-| `z_listaddresses`     | 5.0.0      | The `z_listaddresses` RPC method.
-| `addrtype`            | 5.0.0      | The `type` attribute is deprecated in the results of RPC methods that return address metadata. It is recommended that applications using this metadata be updated to use the `pool` or `address_type` attributes, which have replaced the `type` attribute, as appropriate.
-| `wallettxvjoinsplit`  | 5.1.0      | The `vjoinsplit` attribute returned by the `gettransaction` RPC method.
+| `feature`                           | Deprecated | Default-disabled | Feature details
+|-------------------------------------|------------|------------------|----------------
+| `legacy_privacy`                    | 5.0.0      | 5.4.0            | The default "legacy" privacy policy for `z_sendmany` has been replaced by the `FullPrivacy` directive.
+| `getnewaddress`                     | 5.0.0      | 5.4.0            | The `getnewaddress` RPC method.
+| `getrawchangeaddress`               | 5.0.0      | 5.4.0            | The `getrawchangeaddress` RPC method.
+| `z_getnewaddress`                   | 5.0.0      | 5.4.0            | The `z_getnewaddress` RPC method.
+| `z_listaddresses`                   | 5.0.0      | 5.4.0            | The `z_listaddresses` RPC method.
+| `addrtype`                          | 5.0.0      | 5.4.0 `*`        | The `type` attribute is deprecated in the results of RPC methods that return address metadata. It is recommended that applications using this metadata be updated to use the `pool` or `address_type` attributes, which have replaced the `type` attribute, as appropriate.
+| `wallettxvjoinsplit`                | 5.1.0      | 5.4.0            | The `vjoinsplit` attribute returned by the `gettransaction` RPC method.
+| `z_getbalance`                      | 5.0.0      | 6.2.0            | The `z_getbalance` RPC method.
+| `gbt_oldhashes`                     | 5.4.0      | 6.2.0            | The `finalsaplingroothash`, `lightclientroothash`, and `blockcommitmentshash` fields in the output of `getblocktemplate`, which are replaced by the `defaultroots` field.
+| `deprecationinfo_deprecationheight` | 5.5.0      | 6.2.0            | The `deprecationheight` field returned by the `getdeprecationinfo` RPC method has been replaced by the `end_of_service` object.
+| `getnetworkhashps`                  | 6.2.0      | 6.2.0            | The `getnetworkhashps` RPC method (use `getnetworksolps` instead).
+
+`*` As of version 6.2.0, `addrtype` is default-disabled even when zcashd is compiled without the `ENABLE_WALLET` flag.

@@ -1,11 +1,16 @@
 #include "gtest/utils.h"
 #include "rpc/server.h"
+#include "ui_interface.h"
+
+#include <atomic>
 #ifdef ENABLE_WALLET
 #include "wallet/wallet.h"
 #endif
 
 #include "zcash/IncrementalMerkleTree.hpp"
 #include "transaction_builder.h"
+
+#include <rust/init.h>
 
 int GenZero(int n)
 {
@@ -17,6 +22,24 @@ int GenMax(int n)
     return n-1;
 }
 
+void ConnectMockUIInterface(MockUIInterface& mock)
+{
+    uiInterface.ThreadSafeMessageBox.disconnect_all_slots();
+    uiInterface.ThreadSafeMessageBox.connect(
+        [&mock](const std::string& message, const std::string& caption, unsigned int style) {
+            return mock.ThreadSafeMessageBox(message, caption, style);
+        });
+}
+
+// Defined in init.cpp.
+extern std::atomic<bool> fRequestShutdown;
+
+void DisconnectMockUIInterface()
+{
+    uiInterface.ThreadSafeMessageBox.disconnect_all_slots();
+    fRequestShutdown = false;
+}
+
 void LoadProofParameters() {
     fs::path sprout_groth16 = ZC_GetParamsDir() / "sprout-groth16.params";
 
@@ -25,9 +48,10 @@ void LoadProofParameters() {
         "librustzcash not configured correctly");
     auto sprout_groth16_str = sprout_groth16.native();
 
-    librustzcash_init_zksnark_params(
-        reinterpret_cast<const codeunit*>(sprout_groth16_str.c_str()),
-        sprout_groth16_str.length(),
+    init::zksnark_params(
+        rust::String(
+            reinterpret_cast<const codeunit*>(sprout_groth16_str.data()),
+            sprout_groth16_str.size()),
         true
     );
 }
@@ -76,9 +100,15 @@ template<> void AppendRandomLeaf(OrchardMerkleFrontier &tree) {
     // fortunately the tests only require that the tree root change.
     // TODO: Remove the need to create proofs by having a testing-only way to
     // append a random leaf to OrchardMerkleFrontier.
+    RawHDSeed seed(32, 0);
+    auto to = libzcash::OrchardSpendingKey::ForAccount(seed, 133, 0)
+        .ToFullViewingKey()
+        .GetChangeAddress();
     uint256 orchardAnchor;
     uint256 dataToBeSigned;
-    auto builder = orchard::Builder(true, true, orchardAnchor);
+    // TODO: Create bundle.
+    auto builder = orchard::Builder(false, orchardAnchor);
+    builder.AddOutput(std::nullopt, to, 0, std::nullopt);
     auto bundle = builder.Build().value().ProveAndSign({}, dataToBeSigned).value();
     tree.AppendBundle(bundle);
 }

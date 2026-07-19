@@ -1,12 +1,11 @@
 use libc::{c_char, size_t};
+use macro_find_and_replace::replace_token_sequence;
 use std::{
-    convert::{TryFrom, TryInto},
+    borrow::Cow,
     ffi::{CStr, CString},
     ptr, slice,
 };
 use zeroize::Zeroize;
-
-use zcash_primitives::zip339;
 
 // It's safer to use a wrapper type here than an enum. We can't stop a C caller from passing
 // an unrecognized value as a `language` parameter; if it were an enum on the Rust side,
@@ -15,24 +14,87 @@ use zcash_primitives::zip339;
 #[derive(Copy, Clone)]
 pub struct Language(pub u32);
 
-impl TryFrom<Language> for zip339::Language {
-    type Error = ();
-
-    fn try_from(language: Language) -> Result<Self, ()> {
+impl Language {
+    #[allow(clippy::too_many_arguments)]
+    fn handle<Ctx, T>(
+        self,
+        ctx: Ctx,
+        en: impl FnOnce(Ctx) -> Option<T>,
+        zh_cn: impl FnOnce(Ctx) -> Option<T>,
+        zh_tw: impl FnOnce(Ctx) -> Option<T>,
+        cs: impl FnOnce(Ctx) -> Option<T>,
+        fr: impl FnOnce(Ctx) -> Option<T>,
+        it: impl FnOnce(Ctx) -> Option<T>,
+        ja: impl FnOnce(Ctx) -> Option<T>,
+        ko: impl FnOnce(Ctx) -> Option<T>,
+        pt: impl FnOnce(Ctx) -> Option<T>,
+        es: impl FnOnce(Ctx) -> Option<T>,
+    ) -> Option<T> {
         // These must match `src/rust/include/zip339.h`.
-        match language {
-            Language(0) => Ok(zip339::Language::English),
-            Language(1) => Ok(zip339::Language::SimplifiedChinese),
-            Language(2) => Ok(zip339::Language::TraditionalChinese),
-            Language(3) => Ok(zip339::Language::Czech),
-            Language(4) => Ok(zip339::Language::French),
-            Language(5) => Ok(zip339::Language::Italian),
-            Language(6) => Ok(zip339::Language::Japanese),
-            Language(7) => Ok(zip339::Language::Korean),
-            Language(8) => Ok(zip339::Language::Portuguese),
-            Language(9) => Ok(zip339::Language::Spanish),
-            Language(_) => Err(()),
+        match self {
+            Language(0) => en(ctx),
+            Language(1) => zh_cn(ctx),
+            Language(2) => zh_tw(ctx),
+            Language(3) => cs(ctx),
+            Language(4) => fr(ctx),
+            Language(5) => it(ctx),
+            Language(6) => ja(ctx),
+            Language(7) => ko(ctx),
+            Language(8) => pt(ctx),
+            Language(9) => es(ctx),
+            Language(_) => None,
         }
+    }
+}
+
+macro_rules! all_languages {
+    ($self:expr, $ctx:expr, $e:expr) => {
+        $self.handle(
+            $ctx,
+            replace_token_sequence!{[LANGUAGE], [bip0039::English], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::ChineseSimplified], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::ChineseTraditional], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::Czech], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::French], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::Italian], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::Japanese], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::Korean], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::Portuguese], $e},
+            replace_token_sequence!{[LANGUAGE], [bip0039::Spanish], $e},
+        )
+    };
+}
+
+impl Language {
+    fn with_mnemonic_phrase_from_entropy<E: Into<Vec<u8>>, T>(
+        self,
+        entropy: E,
+        f: impl FnOnce(&str) -> Option<T>,
+    ) -> Option<T> {
+        all_languages!(self, (entropy, f), |(entropy, f)| {
+            bip0039::Mnemonic::<LANGUAGE>::from_entropy(entropy)
+                .ok()
+                .and_then(|mnemonic| f(mnemonic.phrase()))
+        })
+    }
+
+    fn with_seed_from_mnemonic_phrase<'a, P: Into<Cow<'a, str>>, T>(
+        self,
+        phrase: P,
+        passphrase: &str,
+        f: impl FnOnce([u8; 64]) -> Option<T>,
+    ) -> Option<T> {
+        all_languages!(self, (phrase, passphrase, f), |(phrase, passphrase, f)| {
+            bip0039::Mnemonic::<LANGUAGE>::from_phrase(phrase)
+                .ok()
+                .and_then(|mnemonic| f(mnemonic.to_seed(passphrase)))
+        })
+    }
+
+    fn validate_mnemonic<'a, P: Into<Cow<'a, str>>>(self, phrase: P) -> Option<()> {
+        all_languages!(self, phrase, |phrase| {
+            bip0039::Mnemonic::<LANGUAGE>::validate(phrase).ok()
+        })
     }
 }
 
@@ -47,15 +109,14 @@ pub extern "C" fn zip339_entropy_to_phrase(
 ) -> *const c_char {
     assert!(!entropy.is_null());
 
-    if let Ok(language) = language.try_into() {
-        let entropy = unsafe { slice::from_raw_parts(entropy, entropy_len) }.to_vec();
-        if let Ok(mnemonic) = zip339::Mnemonic::from_entropy_in(language, entropy) {
-            if let Ok(phrase) = CString::new(mnemonic.phrase()) {
-                return phrase.into_raw() as *const c_char;
-            }
-        }
-    }
-    ptr::null()
+    let entropy = unsafe { slice::from_raw_parts(entropy, entropy_len) }.to_vec();
+    language
+        .with_mnemonic_phrase_from_entropy(entropy, |phrase| {
+            CString::new(phrase)
+                .ok()
+                .map(|phrase| phrase.into_raw() as *const c_char)
+        })
+        .unwrap_or(ptr::null())
 }
 
 /// Frees a phrase returned by `zip339_entropy_to_phrase`.
@@ -76,10 +137,8 @@ pub extern "C" fn zip339_free_phrase(phrase: *const c_char) {
 pub extern "C" fn zip339_validate_phrase(language: Language, phrase: *const c_char) -> bool {
     assert!(!phrase.is_null());
 
-    if let Ok(language) = language.try_into() {
-        if let Ok(phrase) = unsafe { CStr::from_ptr(phrase) }.to_str() {
-            return zip339::Mnemonic::validate_in(language, phrase).is_ok();
-        }
+    if let Ok(phrase) = unsafe { CStr::from_ptr(phrase) }.to_str() {
+        return language.validate_mnemonic(phrase).is_some();
     }
     false
 }
@@ -95,20 +154,23 @@ pub extern "C" fn zip339_phrase_to_seed(
     assert!(!phrase.is_null());
     assert!(!buf.is_null());
 
-    if let Ok(language) = language.try_into() {
-        if let Ok(phrase) = unsafe { CStr::from_ptr(phrase) }.to_str() {
-            if let Ok(mnemonic) = zip339::Mnemonic::from_phrase_in(language, phrase) {
-                // Use the empty passphrase.
-                let seed = mnemonic.to_seed("");
+    let phrase = unsafe { CStr::from_ptr(phrase) };
+    phrase
+        .to_str()
+        .ok()
+        .and_then(|phrase| {
+            // Use the empty passphrase.
+            language.with_seed_from_mnemonic_phrase(phrase, "", |seed| {
                 unsafe {
                     ptr::copy(seed.as_ptr(), buf, 64);
                 }
-                return true;
+                Some(true)
+            })
+        })
+        .unwrap_or_else(|| {
+            unsafe {
+                ptr::write_bytes(buf, 0, 64);
             }
-        }
-    }
-    unsafe {
-        ptr::write_bytes(buf, 0, 64);
-    }
-    false
+            false
+        })
 }

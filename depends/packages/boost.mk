@@ -1,8 +1,13 @@
 package=boost
-$(package)_version=1_82_0
-$(package)_download_path=https://boostorg.jfrog.io/artifactory/main/release/$(subst _,.,$($(package)_version))/source/
+# Held at 1.88.0, the last release before Boost 1.89.0 removed support for
+# Windows versions older than Windows 10 (Boost.Atomic's wait/notify backend
+# began using the WaitOnAddress API unconditionally). Bumping past 1.88.0 raises
+# the minimum supported Windows version from the 0x0601 (Windows 7) that
+# hosts/mingw32.mk and configure.ac target; do not update without addressing that.
+$(package)_version=1_88_0
+$(package)_download_path=https://archives.boost.io/release/$(subst _,.,$($(package)_version))/source/
 $(package)_file_name=boost_$($(package)_version).tar.bz2
-$(package)_sha256_hash=a6e1ab9b0860e6a2881dd7b21fe9f737a095e5f33a3a874afc6a345228597ee6
+$(package)_sha256_hash=46d9d2c06637b219270877c9e16155cbd015b6dc84349af064c088e9b5b12f7b
 $(package)_dependencies=native_b2
 
 ifneq ($(host_os),darwin)
@@ -27,7 +32,7 @@ $(package)_toolset_$(host_os)=clang
 else
 $(package)_toolset_$(host_os)=gcc
 endif
-$(package)_config_libraries=chrono,filesystem,program_options,system,thread,test
+$(package)_config_libraries=chrono,filesystem,program_options,thread,test
 $(package)_cxxflags+=-std=c++17 -fvisibility=hidden
 $(package)_cxxflags_linux=-fPIC
 $(package)_cxxflags_freebsd=-fPIC

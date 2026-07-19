@@ -186,16 +186,11 @@ HistoryNode CCoinsViewDB::GetHistoryAt(uint32_t epochId, HistoryIndex index) con
         if (!db.Read(make_pair(DB_MMR_NODE, make_pair(epochId, index)), tmpMmrNode)) {
             throw runtime_error("History data inconsistent (expected node not found) - reindex?");
         }
-        std::copy(std::begin(tmpMmrNode), std::end(tmpMmrNode), mmrNode.bytes);
+        std::copy(std::begin(tmpMmrNode), std::end(tmpMmrNode), mmrNode.begin());
     } else {
-        // Read mmrNode into tmp std::array
-        std::array<unsigned char, NODE_SERIALIZED_LENGTH> tmpMmrNode;
-
-        if (!db.Read(make_pair(DB_MMR_NODE, make_pair(epochId, index)), tmpMmrNode)) {
+        if (!db.Read(make_pair(DB_MMR_NODE, make_pair(epochId, index)), mmrNode)) {
             throw runtime_error("History data inconsistent (expected node not found) - reindex?");
         }
-
-        std::copy(std::begin(tmpMmrNode), std::end(tmpMmrNode), mmrNode.bytes);
     }
 
     return mmrNode;
@@ -274,10 +269,7 @@ void BatchWriteHistory(CDBBatch& batch, CHistoryCacheMap& historyCacheMap) {
 
         // replace/append new/updated entries
         for (auto it = historyCache.appends.begin(); it != historyCache.appends.end(); it++) {
-            // Write mmrNode into tmp std::array
-            std::array<unsigned char, NODE_SERIALIZED_LENGTH> tmpMmrNode;
-            std::copy((it->second).bytes, (it->second).bytes + NODE_SERIALIZED_LENGTH, std::begin(tmpMmrNode));
-            batch.Write(make_pair(DB_MMR_NODE, make_pair(epochId, it->first)), tmpMmrNode);
+            batch.Write(make_pair(DB_MMR_NODE, make_pair(epochId, it->first)), it->second);
         }
 
         // write new length
@@ -722,6 +714,7 @@ bool CBlockTreeDB::LoadBlockIndexGuts(
                 pindexNew->nTx            = diskindex.nTx;
                 pindexNew->nChainSupplyDelta = diskindex.nChainSupplyDelta;
                 pindexNew->nTransparentValue = diskindex.nTransparentValue;
+                pindexNew->nLockboxValue = diskindex.nLockboxValue;
                 pindexNew->nSproutValue   = diskindex.nSproutValue;
                 pindexNew->nSaplingValue  = diskindex.nSaplingValue;
                 pindexNew->nOrchardValue  = diskindex.nOrchardValue;
@@ -730,8 +723,8 @@ bool CBlockTreeDB::LoadBlockIndexGuts(
                 pindexNew->hashChainHistoryRoot = diskindex.hashChainHistoryRoot;
                 pindexNew->hashAuthDataRoot = diskindex.hashAuthDataRoot;
 
-                // Check the block hash against the required difficulty as encoded in the 
-                // nBits field. The probability of this succeeding randomly is low enough 
+                // Check the block hash against the required difficulty as encoded in the
+                // nBits field. The probability of this succeeding randomly is low enough
                 // that it is a useful check to detect logic or disk storage errors.
                 if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, Params().GetConsensus()))
                     return error("LoadBlockIndex(): CheckProofOfWork failed: %s", pindexNew->ToString());

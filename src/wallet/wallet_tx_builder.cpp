@@ -4,6 +4,7 @@
 
 #include "wallet/wallet_tx_builder.h"
 
+#include "init.h"
 #include "script/sign.h"
 #include "util/moneystr.h"
 #include "zip317.h"
@@ -677,7 +678,7 @@ WalletTxBuilder::ResolveInputsAndPayments(
     std::optional<AddressResolutionError> resolutionError;
     for (const auto& payment : payments) {
         auto res = ResolvePayment(payment, canResolveOrchard, strategy, maxSaplingAvailable, maxOrchardAvailable, orchardOutputs);
-        res.map([&](const ResolvedPayment& rpayment) { resolvedPayments.emplace_back(rpayment); });
+        (void)res.map([&](const ResolvedPayment& rpayment) { resolvedPayments.emplace_back(rpayment); });
         if (!res.has_value()) {
             return tl::make_unexpected(res.error());
         }
@@ -937,9 +938,6 @@ TransactionBuilderResult TransactionEffects::ApproveAndBuild(
         orchardAnchor = anchorBlockIndex->hashFinalOrchardRoot;
     }
 
-    auto builder = TransactionBuilder(params, nextBlockHeight, orchardAnchor, &wallet);
-    builder.SetFee(fee);
-
     // Track the total of notes that we've added to the builder. This
     // shouldn't strictly be necessary, given `spendable.LimitToAmount`
     CAmount totalSpend = 0;
@@ -966,6 +964,23 @@ TransactionBuilderResult TransactionEffects::ApproveAndBuild(
     std::vector<std::pair<libzcash::OrchardSpendingKey, orchard::SpendInfo>> orchardSpendInfo;
     {
         LOCK(wallet.cs_wallet);
+
+        // Refuse to gather spend inputs once a shutdown has been requested.
+        // Shutdown is asynchronous, so the node may still be up, but shielded proof
+        // construction is slow relative to the shutdown process, so a transaction
+        // started now is unlikely to complete. More importantly, when the shutdown
+        // was triggered by a detected Orchard note commitment tree divergence (see
+        // OrchardNoteCommitmentTreeDiverged), the wallet's tree is known to be
+        // inconsistent, so reading it to select anchors and witnesses would build
+        // against bad state. The divergence detector requests the shutdown while
+        // holding cs_wallet (in CWallet::IncrementNoteWitnesses); checking here
+        // under the same lock that guards the witness reads below ensures any spend
+        // that begins after detection observes the request.
+        if (ShutdownRequested()) {
+            return TransactionBuilderResult(
+                "Cannot create a shielded transaction while the node is shutting down.");
+        }
+
         if (!wallet.GetSaplingNoteWitnesses(
                     saplingOutPoints,
                     anchorConfirmations,
@@ -979,10 +994,13 @@ TransactionBuilderResult TransactionEffects::ApproveAndBuild(
         if (orchardAnchor.has_value()) {
             orchardSpendInfo = wallet.GetOrchardSpendInfo(
                     spendable.orchardNoteMetadata,
-                    anchorConfirmations,
-                    orchardAnchor.value());
+                    orchardAnchor.value(),
+                    anchorHeight);
         }
     }
+
+    auto builder = TransactionBuilder(params, nextBlockHeight, orchardAnchor, saplingAnchor, &wallet);
+    builder.SetFee(fee);
 
     // Add Orchard spends
     for (size_t i = 0; i < orchardSpendInfo.size(); i++) {

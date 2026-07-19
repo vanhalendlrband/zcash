@@ -5,11 +5,13 @@
 #include "chainparams.h"
 #include "consensus/merkle.h"
 #include "fs.h"
+#include "init.h"
 #include "key_io.h"
 #include "main.h"
 #include "primitives/block.h"
 #include "random.h"
 #include "transaction_builder.h"
+#include "ui_interface.h"
 #include "gtest/utils.h"
 #include "util/test.h"
 #include "wallet/wallet.h"
@@ -61,9 +63,11 @@ public:
                                 const CBlockIndex* pindex,
                                 const CBlock* pblock,
                                 MerkleFrontiers& frontiers,
-                                bool performOrchardWalletUpdates) {
+                                bool performOrchardWalletUpdates,
+                                bool performConsistencyCheck) {
         CWallet::IncrementNoteWitnesses(
-                consensus, pindex, pblock, frontiers, performOrchardWalletUpdates);
+                consensus, pindex, pblock, frontiers, performOrchardWalletUpdates,
+                performConsistencyCheck);
     }
 
 
@@ -109,7 +113,7 @@ static std::pair<JSOutPoint, SaplingOutPoint> CreateValidBlock(TestWallet& walle
     wallet.LoadWalletTx(wtx);
 
     block.vtx.push_back(wtx);
-    wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index, &block, frontiers, true);
+    wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index, &block, frontiers, true, false);
 
     return std::make_pair(jsoutpt, saplingNotes[0]);
 }
@@ -421,13 +425,14 @@ TEST(WalletTests, SetSaplingNoteAddrsInCWalletTx) {
         auto cm = note.cmu().value();
         SaplingMerkleTree tree;
         tree.append(cm);
+        auto anchor = tree.root();
         auto witness = tree.witness();
 
         auto nf = note.nullifier(fvk, witness.position());
         ASSERT_TRUE(nf);
         uint256 nullifier = nf.value();
 
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, anchor);
         builder.AddSaplingSpend(sk, note, witness);
         builder.AddSaplingOutput(fvk.ovk, pk, 50000, {});
         builder.SetFee(0);
@@ -564,7 +569,7 @@ TEST(WalletTests, FindMySaplingNotes) {
     auto testNote = GetTestSaplingNote(pa, 50000);
 
     // Generate transaction
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
     builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
     builder.AddSaplingOutput(extfvk.fvk.ovk, pa, 25000, {});
     auto tx = builder.Build().GetTxOrThrow();
@@ -708,10 +713,11 @@ TEST(WalletTests, GetConflictedSaplingNotes) {
 
         MerkleFrontiers frontiers;
         frontiers.sapling.append(cm);
+        auto anchor = frontiers.sapling.root();
         auto witness = frontiers.sapling.witness();
 
         // Generate tx to create output note B
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, anchor);
         builder.AddSaplingSpend(sk, note, witness);
         builder.AddSaplingOutput(extfvk.fvk.ovk, pk, 35000, {});
         auto tx = builder.Build().GetTxOrThrow();
@@ -737,7 +743,7 @@ TEST(WalletTests, GetConflictedSaplingNotes) {
         wallet.LoadWalletTx(wtx);
 
         // Simulate receiving new block and ChainTip signal
-        wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true);
+        wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, false);
         wallet.UpdateSaplingNullifierNoteMapForBlock(&block);
 
         // Retrieve the updated wtx from wallet
@@ -758,13 +764,13 @@ TEST(WalletTests, GetConflictedSaplingNotes) {
         auto nullifier2 = maybe_nf.value();
 
         // Create transaction to spend note B
-        auto builder2 = TransactionBuilder(Params(), 2, std::nullopt);
+        auto builder2 = TransactionBuilder(Params(), 2, std::nullopt, spend_note_witness.root());
         builder2.AddSaplingSpend(sk, note2, spend_note_witness);
         builder2.AddSaplingOutput(extfvk.fvk.ovk, pk, 2000, {});
         auto tx2 = builder2.Build().GetTxOrThrow();
 
         // Create conflicting transaction which also spends note B
-        auto builder3 = TransactionBuilder(Params(), 2, std::nullopt);
+        auto builder3 = TransactionBuilder(Params(), 2, std::nullopt, spend_note_witness.root());
         builder3.AddSaplingSpend(sk, note2, spend_note_witness);
         builder3.AddSaplingOutput(extfvk.fvk.ovk, pk, 1999, {});
         auto tx3 = builder3.Build().GetTxOrThrow();
@@ -822,7 +828,7 @@ TEST(WalletTests, GetConflictedOrchardNotes) {
     auto scriptPubKey = GetScriptForDestination(tkeyid);
 
     // Generate a bundle containing output note A.
-    auto builder = TransactionBuilder(Params(), 1, orchardAnchor, &keystore);
+    auto builder = TransactionBuilder(Params(), 1, orchardAnchor, SaplingMerkleTree::empty_root(), &keystore);
     builder.AddTransparentInput(COutPoint(uint256(), 0), scriptPubKey, 5000);
     builder.AddOrchardOutput(std::nullopt, recipient, 4000, {});
     auto maybeTx = builder.Build();
@@ -859,8 +865,10 @@ TEST(WalletTests, GetConflictedOrchardNotes) {
     wtx.SetMerkleBranch(block);
     wallet.LoadWalletTx(wtx);
 
-    // Simulate receiving new block and ChainTip signal
-    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true);
+    // Simulate receiving a new block and ChainTip signal at the chain tip, exercising
+    // the Orchard consistency check (performConsistencyCheck = true). This block's
+    // hashFinalOrchardRoot was set consistently above, so the check passes.
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, true);
 
     // Fetch the Orchard note so we can spend it.
     std::vector<SproutNoteEntry> sproutEntries;
@@ -876,8 +884,10 @@ TEST(WalletTests, GetConflictedOrchardNotes) {
     auto recipient2 = ivk.Address(j2);
 
     // Generate tx to spend note A
-    auto builder2 = TransactionBuilder(Params(), 2, orchardTree.root());
-    auto noteToSpend = std::move(wallet.GetOrchardSpendInfo(orchardEntries, 1, orchardTree.root())[0]);
+    auto builder2 = TransactionBuilder(Params(), 2, orchardTree.root(), SaplingMerkleTree::empty_root());
+    // The wallet checkpointed this single block at height 0, so the anchor (the
+    // tree root after that block) is at absolute height 0.
+    auto noteToSpend = std::move(wallet.GetOrchardSpendInfo(orchardEntries, orchardTree.root(), 0)[0]);
     builder2.AddOrchardSpend(std::move(noteToSpend.first), std::move(noteToSpend.second));
     auto maybeTx2 = builder2.Build();
     EXPECT_TRUE(maybeTx2.IsTx());
@@ -889,8 +899,8 @@ TEST(WalletTests, GetConflictedOrchardNotes) {
     CWalletTx wtx2 {&wallet, tx2};
 
     // Generate conflicting tx to spend note A
-    auto noteToSpend2 = std::move(wallet.GetOrchardSpendInfo(orchardEntries, 1, orchardTree.root())[0]);
-    auto builder3 = TransactionBuilder(Params(), 2, orchardTree.root());
+    auto noteToSpend2 = std::move(wallet.GetOrchardSpendInfo(orchardEntries, orchardTree.root(), 0)[0]);
+    auto builder3 = TransactionBuilder(Params(), 2, orchardTree.root(), SaplingMerkleTree::empty_root());
     builder3.AddOrchardSpend(std::move(noteToSpend2.first), std::move(noteToSpend2.second));
     auto maybeTx3 = builder3.Build();
     EXPECT_TRUE(maybeTx3.IsTx());
@@ -931,6 +941,111 @@ TEST(WalletTests, GetConflictedOrchardNotes) {
     chainActive.SetTip(NULL);
     mapBlockIndex.erase(blockHash);
 
+    RegtestDeactivateNU5();
+}
+
+// Fixture for tests that a detected Orchard note commitment tree divergence triggers
+// the clean-shutdown recovery (OrchardNoteCommitmentTreeDiverged) instead of aborting.
+// SetUp connects a mock for the operator notification; TearDown disconnects it and
+// clears any requested shutdown — guaranteed even on an early return (ASSERT_*) or an
+// exception.
+class OrchardDivergenceTest : public ::testing::Test {
+protected:
+    void SetUp() override { ConnectMockUIInterface(mock_); }
+    void TearDown() override { DisconnectMockUIInterface(); }
+    MockUIInterface mock_;
+};
+
+// Regression test for #5960. When the re-enabled forward consistency check connects a
+// block near the tip and finds the wallet's Orchard note commitment tree root
+// inconsistent with the block's consensus root, it must request a clean shutdown (so
+// the operator can restart with -rescan) rather than abort the node.
+TEST_F(OrchardDivergenceTest, ForwardConsistencyCheckRequestsCleanShutdown) {
+    auto consensusParams = RegtestActivateNU5();
+    TestWallet wallet(Params());
+    wallet.GenerateNewSeed();
+
+    LOCK2(cs_main, wallet.cs_wallet);
+
+    MerkleFrontiers frontiers;
+    CBlock block;
+    CBlockIndex fakeIndex {block};
+    fakeIndex.nHeight = 0;
+    // Record a consensus Orchard root that the wallet's tree will not match, standing
+    // in for a divergence between the wallet and consensus.
+    fakeIndex.hashFinalOrchardRoot = uint256S("ff");
+    auto blockHash = block.GetHash();
+    mapBlockIndex.insert(std::make_pair(blockHash, &fakeIndex));
+    chainActive.SetTip(&fakeIndex);
+
+    ASSERT_FALSE(ShutdownRequested());
+    // The divergence handler must notify the operator via ThreadSafeMessageBox.
+    EXPECT_CALL(mock_, ThreadSafeMessageBox(
+        ::testing::_, ::testing::_, CClientUIInterface::MSG_ERROR)).WillOnce(::testing::Return(false));
+
+    // Connect the block with the consistency check enabled.
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, true);
+
+    // The divergence must have been detected and a clean shutdown requested, not an abort.
+    EXPECT_TRUE(ShutdownRequested());
+
+    // Tear down (the mock and shutdown cleanup is handled by the fixture's TearDown).
+    chainActive.SetTip(NULL);
+    mapBlockIndex.erase(blockHash);
+    RegtestDeactivateNU5();
+}
+
+// Regression test for #5960. When a reorg disconnects a block and DecrementNoteWitnesses
+// finds the rewound wallet Orchard tree inconsistent with the parent block's consensus
+// root, it must request a clean shutdown rather than abort the node — the restart-proof
+// crash loop that motivated this work. Previously this was a fatal assertion.
+TEST_F(OrchardDivergenceTest, DisconnectRequestsCleanShutdown) {
+    auto consensusParams = RegtestActivateNU5();
+    TestWallet wallet(Params());
+    wallet.GenerateNewSeed();
+
+    LOCK2(cs_main, wallet.cs_wallet);
+
+    MerkleFrontiers frontiers;
+
+    // Connect two blocks so the wallet has checkpoints at heights 0 and 1, so that
+    // disconnecting block 1 rewinds to block 0. The consistency check is left off
+    // during setup (false) so the connect path does not itself request a shutdown.
+    CBlock block0;
+    CBlockIndex fakeIndex0 {block0};
+    fakeIndex0.nHeight = 0;
+    // Record a consensus Orchard root for block 0 that the wallet will not match.
+    fakeIndex0.hashFinalOrchardRoot = uint256S("ff");
+    auto blockHash0 = block0.GetHash();
+    mapBlockIndex.insert(std::make_pair(blockHash0, &fakeIndex0));
+    chainActive.SetTip(&fakeIndex0);
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex0, &block0, frontiers, true, false);
+
+    CBlock block1;
+    block1.hashPrevBlock = blockHash0;
+    CBlockIndex fakeIndex1 {block1};
+    fakeIndex1.nHeight = 1;
+    fakeIndex1.pprev = &fakeIndex0;
+    auto blockHash1 = block1.GetHash();
+    mapBlockIndex.insert(std::make_pair(blockHash1, &fakeIndex1));
+    chainActive.SetTip(&fakeIndex1);
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex1, &block1, frontiers, true, false);
+
+    ASSERT_FALSE(ShutdownRequested());
+    // The divergence handler must notify the operator via ThreadSafeMessageBox.
+    EXPECT_CALL(mock_, ThreadSafeMessageBox(
+        ::testing::_, ::testing::_, CClientUIInterface::MSG_ERROR)).WillOnce(::testing::Return(false));
+
+    // Disconnect block 1: this rewinds to block 0, whose recorded consensus root does
+    // not match the wallet's, so a clean shutdown must be requested.
+    wallet.DecrementNoteWitnesses(consensusParams, &fakeIndex1);
+
+    EXPECT_TRUE(ShutdownRequested());
+
+    // Tear down (the mock and shutdown cleanup is handled by the fixture's TearDown).
+    chainActive.SetTip(NULL);
+    mapBlockIndex.erase(blockHash0);
+    mapBlockIndex.erase(blockHash1);
     RegtestDeactivateNU5();
 }
 
@@ -992,7 +1107,7 @@ TEST(WalletTests, SaplingNullifierIsSpent) {
     auto testNote = GetTestSaplingNote(pa, 50000);
 
     // Generate transaction
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
     builder.AddSaplingSpend(sk,  testNote.note, testNote.tree.witness());
     builder.AddSaplingOutput(extfvk.fvk.ovk, pa, 25000, {});
     auto tx = builder.Build().GetTxOrThrow();
@@ -1079,7 +1194,7 @@ TEST(WalletTests, NavigateFromSaplingNullifierToNote) {
     auto testNote = GetTestSaplingNote(pa, 50000);
 
     // Generate transaction
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
     builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
     builder.AddSaplingOutput(extfvk.fvk.ovk, pa, 25000, {});
     auto tx = builder.Build().GetTxOrThrow();
@@ -1093,7 +1208,13 @@ TEST(WalletTests, NavigateFromSaplingNullifierToNote) {
     ASSERT_TRUE(nf);
     uint256 nullifier = nf.value();
 
-    MerkleFrontiers frontiers = { .sapling = testNote.tree };
+    SproutMerkleTree sproutFrontier;
+    OrchardMerkleFrontier orchardFrontier;
+    MerkleFrontiers frontiers = {
+        .sprout = sproutFrontier,
+        .sapling = testNote.tree,
+        .orchard = orchardFrontier,
+    };
 
     // Verify dummy note is unspent
     EXPECT_FALSE(wallet.IsSaplingSpent(nullifier, std::nullopt));
@@ -1129,7 +1250,7 @@ TEST(WalletTests, NavigateFromSaplingNullifierToNote) {
     }
 
     // Simulate receiving new block and ChainTip signal
-    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true);
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, false);
     wallet.UpdateSaplingNullifierNoteMapForBlock(&block);
 
     // Retrieve the updated wtx from wallet
@@ -1214,10 +1335,11 @@ TEST(WalletTests, SpentSaplingNoteIsFromMe) {
         auto cm = note.cmu().value();
         MerkleFrontiers frontiers;
         frontiers.sapling.append(cm);
+        auto anchor = frontiers.sapling.root();
         auto witness = frontiers.sapling.witness();
 
         // Generate transaction, which sends funds to note B
-        auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+        auto builder = TransactionBuilder(Params(), 1, std::nullopt, anchor);
         builder.AddSaplingSpend(sk, note, witness);
         builder.AddSaplingOutput(extfvk.fvk.ovk, pk, 25000, {});
         auto tx = builder.Build().GetTxOrThrow();
@@ -1247,7 +1369,7 @@ TEST(WalletTests, SpentSaplingNoteIsFromMe) {
         // Simulate receiving new block and ChainTip signal.
         // This triggers calculation of nullifiers for notes belonging to this wallet
         // in the output descriptions of wtx.
-        wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true);
+        wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, false);
         wallet.UpdateSaplingNullifierNoteMapForBlock(&block);
 
         // Retrieve the updated wtx from wallet
@@ -1278,7 +1400,7 @@ TEST(WalletTests, SpentSaplingNoteIsFromMe) {
         auto nullifier2 = maybe_nf.value();
 
         // Create transaction to spend note B
-        auto builder2 = TransactionBuilder(Params(), 2, std::nullopt);
+        auto builder2 = TransactionBuilder(Params(), 2, std::nullopt, spend_note_witness.root());
         builder2.AddSaplingSpend(sk, note2, spend_note_witness);
         builder2.AddSaplingOutput(extfvk.fvk.ovk, pk, 12500, {});
         auto tx2 = builder2.Build().GetTxOrThrow();
@@ -1374,7 +1496,7 @@ TEST(WalletTests, CachedWitnessesEmptyChain) {
     CBlockIndex index(block);
     MerkleFrontiers frontiers;
     const auto& params = Params().GetConsensus();
-    wallet.IncrementNoteWitnesses(params, &index, &block, frontiers, true);
+    wallet.IncrementNoteWitnesses(params, &index, &block, frontiers, true, false);
 
     // this death will occur because there will not be sufficient Sprout witnesses to reach the
     // default anchor depth
@@ -1386,7 +1508,7 @@ TEST(WalletTests, CachedWitnessesEmptyChain) {
         CBlock another_block;
         CBlockIndex another_index(another_block);
         another_index.nHeight = 1;
-        wallet.IncrementNoteWitnesses(params, &another_index, &another_block, frontiers, true);
+        wallet.IncrementNoteWitnesses(params, &another_index, &another_block, frontiers, true, false);
     }
 
     EXPECT_DEATH(::GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, nAnchorConfirmations, sproutWitnesses, saplingWitnesses),
@@ -1396,13 +1518,13 @@ TEST(WalletTests, CachedWitnessesEmptyChain) {
         CBlock another_block;
         CBlockIndex another_index(another_block);
         another_index.nHeight = i;
-        wallet.IncrementNoteWitnesses(params, &another_index, &another_block, frontiers, true);
+        wallet.IncrementNoteWitnesses(params, &another_index, &another_block, frontiers, true, false);
     }
 
     CBlock last_block;
     CBlockIndex last_index(last_block);
     last_index.nHeight = 9;
-    wallet.IncrementNoteWitnesses(params, &last_index, &last_block, frontiers, true);
+    wallet.IncrementNoteWitnesses(params, &last_index, &last_block, frontiers, true, false);
 
     ::GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, nAnchorConfirmations, sproutWitnesses, saplingWitnesses);
 
@@ -1479,8 +1601,12 @@ TEST(WalletTests, CachedWitnessesChainTip) {
         block2.vtx.push_back(wtx);
         CBlockIndex index2(block2);
         index2.nHeight = 2;
-        MerkleFrontiers frontiers2 = { .sprout = frontiers.sprout, .sapling = frontiers.sapling };
-        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers2, true);
+        MerkleFrontiers frontiers2 = {
+            .sprout = frontiers.sprout,
+            .sapling = frontiers.sapling,
+            .orchard = frontiers.orchard,
+        };
+        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers2, true, false);
 
         auto anchors2 = GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, 1, sproutWitnesses, saplingWitnesses);
         EXPECT_NE(anchors2.first, anchors2.second);
@@ -1501,7 +1627,7 @@ TEST(WalletTests, CachedWitnessesChainTip) {
         EXPECT_NE(anchors1.second, anchors3.second);
 
         // Re-incrementing with the same block should give the same result
-        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers, true);
+        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers, true, false);
         auto anchors4 = GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, 1, sproutWitnesses, saplingWitnesses);
         EXPECT_NE(anchors4.first, anchors4.second);
 
@@ -1511,7 +1637,7 @@ TEST(WalletTests, CachedWitnessesChainTip) {
         EXPECT_EQ(anchors2.second, anchors4.second);
 
         // Incrementing with the same block again should not change the cache
-        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers, true);
+        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers, true, false);
         std::vector<std::optional<SproutWitness>> sproutWitnesses5;
         std::vector<std::optional<SaplingWitness>> saplingWitnesses5;
 
@@ -1596,7 +1722,7 @@ TEST(WalletTests, CachedWitnessesDecrementFirst) {
         EXPECT_NE(anchors2.second, anchors4.second);
 
         // Re-incrementing with the same block should give the same result
-        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers, true);
+        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &index2, &block2, frontiers, true, false);
 
         auto anchors5 = GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, 1, sproutWitnesses, saplingWitnesses);
 
@@ -1619,7 +1745,11 @@ TEST(WalletTests, CachedWitnessesCleanIndex) {
     std::vector<uint256> sproutAnchors;
     std::vector<uint256> saplingAnchors;
     MerkleFrontiers frontiers;
-    MerkleFrontiers riFrontiers = { .sprout = frontiers.sprout, .sapling = frontiers.sapling };
+    MerkleFrontiers riFrontiers = {
+        .sprout = frontiers.sprout,
+        .sapling = frontiers.sapling,
+        .orchard = frontiers.orchard,
+    };
     std::vector<std::optional<SproutWitness>> sproutWitnesses;
     std::vector<std::optional<SaplingWitness>> saplingWitnesses;
 
@@ -1653,7 +1783,7 @@ TEST(WalletTests, CachedWitnessesCleanIndex) {
     // used to increment witnesses again.
     for (size_t i = 0; i < numBlocks; i++) {
         MerkleFrontiers riPrevFrontiers{riFrontiers};
-        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &(indices[i]), &(blocks[i]), riFrontiers, true);
+        wallet.IncrementNoteWitnesses(Params().GetConsensus(), &(indices[i]), &(blocks[i]), riFrontiers, true, false);
 
         auto anchors = GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, 1, sproutWitnesses, saplingWitnesses);
         for (size_t j = 0; j < numBlocks; j++) {
@@ -1680,7 +1810,7 @@ TEST(WalletTests, CachedWitnessesCleanIndex) {
             }
 
             {
-                wallet.IncrementNoteWitnesses(Params().GetConsensus(), &(indices[i]), &(blocks[i]), riPrevFrontiers, true);
+                wallet.IncrementNoteWitnesses(Params().GetConsensus(), &(indices[i]), &(blocks[i]), riPrevFrontiers, true, false);
                 auto anchors = GetWitnessesAndAnchors(wallet, sproutNotes, saplingNotes, 1, sproutWitnesses, saplingWitnesses);
                 for (size_t j = 0; j < numBlocks; j++) {
                     EXPECT_TRUE((bool) sproutWitnesses[j]);
@@ -2046,13 +2176,13 @@ TEST(WalletTests, UpdatedSaplingNoteData) {
     auto m = GetTestMasterSaplingSpendingKey();
 
     // Generate dummy Sapling address
-    auto sk = m.Derive(0);
+    auto sk = m.Derive(0 | HARDENED_KEY_LIMIT);
     auto expsk = sk.expsk;
     auto extfvk = sk.ToXFVK();
     auto pa = extfvk.DefaultAddress();
 
     // Generate dummy recipient Sapling address
-    auto sk2 = m.Derive(1);
+    auto sk2 = m.Derive(1 | HARDENED_KEY_LIMIT);
     auto expsk2 = sk2.expsk;
     auto extfvk2 = sk2.ToXFVK();
     auto pa2 = extfvk2.DefaultAddress();
@@ -2060,12 +2190,18 @@ TEST(WalletTests, UpdatedSaplingNoteData) {
     auto testNote = GetTestSaplingNote(pa, 50000);
 
     // Generate transaction
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, testNote.tree.root());
     builder.AddSaplingSpend(sk, testNote.note, testNote.tree.witness());
     builder.AddSaplingOutput(extfvk.fvk.ovk, pa2, 25000, {});
     auto tx = builder.Build().GetTxOrThrow();
 
-    MerkleFrontiers frontiers =  { .sapling = testNote.tree };
+    SproutMerkleTree sproutFrontier;
+    OrchardMerkleFrontier orchardFrontier;
+    MerkleFrontiers frontiers = {
+        .sprout = sproutFrontier,
+        .sapling = testNote.tree,
+        .orchard = orchardFrontier,
+    };
 
     // Wallet contains extfvk1 but not extfvk2
     CWalletTx wtx {&wallet, tx};
@@ -2095,7 +2231,7 @@ TEST(WalletTests, UpdatedSaplingNoteData) {
     wallet.LoadWalletTx(wtx);
 
     // Simulate receiving new block and ChainTip signal
-    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true);
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, false);
     wallet.UpdateSaplingNullifierNoteMapForBlock(&block);
 
     // Retrieve the updated wtx from wallet
@@ -2223,7 +2359,7 @@ TEST(WalletTests, MarkAffectedSaplingTransactionsDirty) {
 
     // Generate shielding tx from transparent to Sapling
     // 0.0005 t-ZEC in, 0.0004 z-ZEC out, default fee
-    auto builder = TransactionBuilder(Params(), 1, std::nullopt, &keystore);
+    auto builder = TransactionBuilder(Params(), 1, std::nullopt, SaplingMerkleTree::empty_root(), &keystore);
     builder.AddTransparentInput(
         COutPoint(uint256S("7777777777777777777777777777777777777777777777777777777777777777"), 0),
         scriptPubKey, 5000);
@@ -2234,7 +2370,7 @@ TEST(WalletTests, MarkAffectedSaplingTransactionsDirty) {
     EXPECT_EQ(tx1.vout.size(), 0);
     EXPECT_EQ(tx1.vJoinSplit.size(), 0);
     EXPECT_EQ(tx1.GetSaplingSpendsCount(), 0);
-    EXPECT_EQ(tx1.GetSaplingOutputsCount(), 1);
+    EXPECT_EQ(tx1.GetSaplingOutputsCount(), 2);
     EXPECT_EQ(tx1.GetValueBalanceSapling(), -4000);
 
     CWalletTx wtx {&wallet, tx1};
@@ -2261,7 +2397,7 @@ TEST(WalletTests, MarkAffectedSaplingTransactionsDirty) {
     wallet.LoadWalletTx(wtx);
 
     // Simulate receiving new block and ChainTip signal
-    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true);
+    wallet.IncrementNoteWitnesses(consensusParams, &fakeIndex, &block, frontiers, true, false);
     wallet.UpdateSaplingNullifierNoteMapForBlock(&block);
 
     // Retrieve the updated wtx from wallet
@@ -2269,17 +2405,23 @@ TEST(WalletTests, MarkAffectedSaplingTransactionsDirty) {
     wtx = wallet.mapWallet[hash];
 
     // Prepare to spend the note that was just created
-    auto maybe_pt = wtx.DecryptSaplingNote(Params(), SaplingOutPoint(hash, 0));
+    auto outpt = SaplingOutPoint(hash, 0);
+    auto maybe_pt = wtx.DecryptSaplingNote(Params(), outpt);
+    if (!static_cast<bool>(maybe_pt)) {
+        outpt = SaplingOutPoint(hash, 1);
+        maybe_pt = wtx.DecryptSaplingNote(Params(), outpt);
+    }
     ASSERT_EQ(static_cast<bool>(maybe_pt), true);
     auto maybe_note = maybe_pt.value().first.note(ivk);
     ASSERT_EQ(static_cast<bool>(maybe_note), true);
     auto note = maybe_note.value();
     auto anchor = frontiers.sapling.root();
-    auto witness = frontiers.sapling.witness();
+    auto witness = wtx.mapSaplingNoteData[outpt].witnesses.back();
+    ASSERT_EQ(anchor, witness.root());
 
     // Create a Sapling-only transaction
     // 0.0004 z-ZEC in, 0.00025 z-ZEC out, default fee, 0.00005 z-ZEC change
-    auto builder2 = TransactionBuilder(Params(), 2, std::nullopt);
+    auto builder2 = TransactionBuilder(Params(), 2, std::nullopt, anchor);
     builder2.AddSaplingSpend(sk, note, witness);
     builder2.AddSaplingOutput(extfvk.fvk.ovk, pk, 2500, {});
     auto tx2 = builder2.Build().GetTxOrThrow();
